@@ -10,12 +10,16 @@ from psycopg2.extras import RealDictCursor
 st.set_page_config(page_title="Sagrado Doce - Sistema", layout="wide", page_icon="🍰")
 
 # --- Função de Conexão com Supabase (PostgreSQL) ---
-# O Streamlit gerencia a conexão e o cache automaticamente
+# --- Função de Conexão com Supabase (PostgreSQL) ---
 def get_db_connection():
-    # Pega a URL dos segredos do Streamlit
-    db_url = st.secrets["connections"]["supabase"]["url"]
-    conn = psycopg2.connect(db_url)
-    return conn
+    # MUDANÇA: Usa a chave simples SUPABASE_URL
+    try:
+        db_url = st.secrets["SUPABASE_URL"]
+        conn = psycopg2.connect(db_url)
+        return conn
+    except Exception as e:
+        st.error(f"Erro de Conexão: {e}")
+        st.stop()
 
 # --- Inicialização do Banco de Dados (Criação de Tabelas) ---
 def init_db():
@@ -515,4 +519,5 @@ with st.sidebar:
         # Limpa todas as tabelas no Supabase
         tables = ["venda_itens", "vendas", "receita_itens", "receitas", "insumos", "caixa", "orcamentos", "vendedoras", "consignacoes"]
         for t in tables: run_query(f"TRUNCATE TABLE {t} CASCADE")
+
         st.session_state.clear(); st.rerun()
