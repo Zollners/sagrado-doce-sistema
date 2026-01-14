@@ -10,59 +10,54 @@ from psycopg2.extras import RealDictCursor
 st.set_page_config(page_title="Sagrado Doce - Sistema", layout="wide", page_icon="🍰")
 
 # --- Função de Conexão com Supabase (PostgreSQL) ---
-# --- Função de Conexão com Supabase (PostgreSQL) ---
 def get_db_connection():
-    # MUDANÇA: Usa a chave simples SUPABASE_URL
     try:
+        # AQUI ESTAVA O ERRO: Agora usamos a chave simples direta
         db_url = st.secrets["SUPABASE_URL"]
         conn = psycopg2.connect(db_url)
         return conn
     except Exception as e:
-        st.error(f"Erro de Conexão: {e}")
+        st.error(f"Erro de Conexão com o Banco: {e}")
         st.stop()
 
-# --- Inicialização do Banco de Dados (Criação de Tabelas) ---
+# --- Inicialização do Banco de Dados ---
 def init_db():
-    conn = get_db_connection()
-    c = conn.cursor()
-    
-    # Sintaxe PostgreSQL (SERIAL em vez de AUTOINCREMENT, TIMESTAMP em vez de TEXT para datas)
-    c.execute('''CREATE TABLE IF NOT EXISTS insumos (id SERIAL PRIMARY KEY, nome TEXT, unidade_medida TEXT, custo_total REAL, qtd_embalagem REAL, fator_conversao REAL, custo_unitario REAL, estoque_atual REAL DEFAULT 0)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS receitas (id SERIAL PRIMARY KEY, nome TEXT, preco_venda REAL, custo_total REAL)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS receita_itens (id SERIAL PRIMARY KEY, receita_id INTEGER, insumo_id INTEGER, qtd_usada REAL, custo_item REAL, FOREIGN KEY(receita_id) REFERENCES receitas(id), FOREIGN KEY(insumo_id) REFERENCES insumos(id))''')
-    c.execute('''CREATE TABLE IF NOT EXISTS vendas (id SERIAL PRIMARY KEY, cliente TEXT, data_pedido TIMESTAMP, tipo_entrega TEXT, endereco TEXT, forma_pagamento TEXT, itens_resumo TEXT, total_venda REAL, status TEXT, status_pagamento TEXT DEFAULT 'Pendente')''')
-    c.execute('''CREATE TABLE IF NOT EXISTS venda_itens (id SERIAL PRIMARY KEY, venda_id INTEGER, receita_id INTEGER, qtd INTEGER, FOREIGN KEY(venda_id) REFERENCES vendas(id), FOREIGN KEY(receita_id) REFERENCES receitas(id))''')
-    c.execute('''CREATE TABLE IF NOT EXISTS caixa (id SERIAL PRIMARY KEY, descricao TEXT, valor REAL, data_movimento TIMESTAMP, tipo TEXT, categoria TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS orcamentos (id SERIAL PRIMARY KEY, cliente TEXT, data_emissao TEXT, validade TEXT, total REAL, itens_resumo TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS vendedoras (id SERIAL PRIMARY KEY, nome TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS consignacoes (id SERIAL PRIMARY KEY, vendedora_id INTEGER, receita_id INTEGER, qtd_entregue REAL, qtd_vendida REAL DEFAULT 0, data_entrega TIMESTAMP, FOREIGN KEY(vendedora_id) REFERENCES vendedoras(id), FOREIGN KEY(receita_id) REFERENCES receitas(id))''')
-    
-    conn.commit()
-    conn.close()
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        # Tabelas com sintaxe PostgreSQL
+        c.execute('''CREATE TABLE IF NOT EXISTS insumos (id SERIAL PRIMARY KEY, nome TEXT, unidade_medida TEXT, custo_total REAL, qtd_embalagem REAL, fator_conversao REAL, custo_unitario REAL, estoque_atual REAL DEFAULT 0)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS receitas (id SERIAL PRIMARY KEY, nome TEXT, preco_venda REAL, custo_total REAL)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS receita_itens (id SERIAL PRIMARY KEY, receita_id INTEGER, insumo_id INTEGER, qtd_usada REAL, custo_item REAL, FOREIGN KEY(receita_id) REFERENCES receitas(id), FOREIGN KEY(insumo_id) REFERENCES insumos(id))''')
+        c.execute('''CREATE TABLE IF NOT EXISTS vendas (id SERIAL PRIMARY KEY, cliente TEXT, data_pedido TIMESTAMP, tipo_entrega TEXT, endereco TEXT, forma_pagamento TEXT, itens_resumo TEXT, total_venda REAL, status TEXT, status_pagamento TEXT DEFAULT 'Pendente')''')
+        c.execute('''CREATE TABLE IF NOT EXISTS venda_itens (id SERIAL PRIMARY KEY, venda_id INTEGER, receita_id INTEGER, qtd INTEGER, FOREIGN KEY(venda_id) REFERENCES vendas(id), FOREIGN KEY(receita_id) REFERENCES receitas(id))''')
+        c.execute('''CREATE TABLE IF NOT EXISTS caixa (id SERIAL PRIMARY KEY, descricao TEXT, valor REAL, data_movimento TIMESTAMP, tipo TEXT, categoria TEXT)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS orcamentos (id SERIAL PRIMARY KEY, cliente TEXT, data_emissao TEXT, validade TEXT, total REAL, itens_resumo TEXT)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS vendedoras (id SERIAL PRIMARY KEY, nome TEXT)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS consignacoes (id SERIAL PRIMARY KEY, vendedora_id INTEGER, receita_id INTEGER, qtd_entregue REAL, qtd_vendida REAL DEFAULT 0, data_entrega TIMESTAMP, FOREIGN KEY(vendedora_id) REFERENCES vendedoras(id), FOREIGN KEY(receita_id) REFERENCES receitas(id))''')
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        st.error(f"Erro ao criar tabelas: {e}")
 
-# Executa a criação das tabelas na inicialização (apenas se não existirem)
 if 'db_initialized' not in st.session_state:
     init_db()
     st.session_state.db_initialized = True
 
 # --- Funções Auxiliares ---
 def run_query(query, params=None):
-    """Função segura para rodar queries no Postgres"""
     conn = get_db_connection()
-    # RealDictCursor faz o resultado vir como dicionário (igual pandas gosta)
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(query, params)
         try:
+            cur.execute(query, params)
             conn.commit()
-            # Se for SELECT, retorna dados
             if query.strip().upper().startswith("SELECT"):
                 return cur.fetchall()
-            # Se for INSERT e tiver RETURNING id, retorna o ID
             if "RETURNING id" in query.lower():
                 return cur.fetchone()['id']
         except Exception as e:
             conn.rollback()
-            st.error(f"Erro no Banco: {e}")
+            st.error(f"Erro na Query: {e}")
     conn.close()
 
 def get_base64_image(image_path):
@@ -516,8 +511,6 @@ with tab_caixa:
 with st.sidebar:
     st.info("ℹ️ Para usar logo: Salve arquivo 'logo.png' na pasta do app.")
     if st.button("🗑️ Resetar Tudo (Banco Zerado)") and st.button("Confirmar Reset"):
-        # Limpa todas as tabelas no Supabase
         tables = ["venda_itens", "vendas", "receita_itens", "receitas", "insumos", "caixa", "orcamentos", "vendedoras", "consignacoes"]
         for t in tables: run_query(f"TRUNCATE TABLE {t} CASCADE")
-
         st.session_state.clear(); st.rerun()
