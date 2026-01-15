@@ -9,17 +9,15 @@ from psycopg2.extras import RealDictCursor
 # --- Configuração da Página ---
 st.set_page_config(page_title="Sagrado Doce - Sistema", layout="wide", page_icon="🍰")
 
-# --- Função de Conexão com Supabase (PostgreSQL) ---
+@st.cache_resource(ttl=3600)
 def get_db_connection():
     try:
-        # AQUI ESTAVA O ERRO: Agora usamos a chave simples direta
         db_url = st.secrets["SUPABASE_URL"]
         conn = psycopg2.connect(db_url)
         return conn
     except Exception as e:
         st.error(f"Erro de Conexão com o Banco: {e}")
         st.stop()
-
 # --- Inicialização do Banco de Dados ---
 def init_db():
     try:
@@ -36,29 +34,33 @@ def init_db():
         c.execute('''CREATE TABLE IF NOT EXISTS vendedoras (id SERIAL PRIMARY KEY, nome TEXT)''')
         c.execute('''CREATE TABLE IF NOT EXISTS consignacoes (id SERIAL PRIMARY KEY, vendedora_id INTEGER, receita_id INTEGER, qtd_entregue REAL, qtd_vendida REAL DEFAULT 0, data_entrega TIMESTAMP, FOREIGN KEY(vendedora_id) REFERENCES vendedoras(id), FOREIGN KEY(receita_id) REFERENCES receitas(id))''')
         conn.commit()
-        conn.close()
+        # NÃO FECHAR A CONEXÃO AQUI
     except Exception as e:
         st.error(f"Erro ao criar tabelas: {e}")
 
-if 'db_initialized' not in st.session_state:
-    init_db()
-    st.session_state.db_initialized = True
-
-# --- Funções Auxiliares ---
+# --- Função Auxiliar de Query (Otimizada) ---
 def run_query(query, params=None):
     conn = get_db_connection()
+    # Verifica se a conexão ainda está viva, se não, limpa o cache e reconecta
+    if conn.closed != 0:
+        st.cache_resource.clear()
+        conn = get_db_connection()
+
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         try:
             cur.execute(query, params)
             conn.commit()
+            
+            # Se for SELECT, retorna dados
             if query.strip().upper().startswith("SELECT"):
                 return cur.fetchall()
+            # Se for INSERT com retorno
             if "RETURNING id" in query.lower():
                 return cur.fetchone()['id']
         except Exception as e:
             conn.rollback()
             st.error(f"Erro na Query: {e}")
-    conn.close()
+    # NÃO FECHAR A CONEXÃO AQUI (conn.close foi removido)
 
 def get_base64_image(image_path):
     if os.path.exists(image_path):
@@ -514,3 +516,4 @@ with st.sidebar:
         tables = ["venda_itens", "vendas", "receita_itens", "receitas", "insumos", "caixa", "orcamentos", "vendedoras", "consignacoes"]
         for t in tables: run_query(f"TRUNCATE TABLE {t} CASCADE")
         st.session_state.clear(); st.rerun()
+
