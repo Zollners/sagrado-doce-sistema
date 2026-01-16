@@ -9,7 +9,7 @@ from psycopg2.extras import RealDictCursor
 # --- Configuração da Página ---
 st.set_page_config(page_title="Sagrado Doce - Sistema", layout="wide", page_icon="🍰")
 
-# --- 1. CONEXÃO COM CACHE (Mantém a linha aberta) ---
+# --- 1. CONEXÃO COM CACHE ---
 @st.cache_resource(ttl=3600)
 def get_db_connection():
     try:
@@ -17,10 +17,10 @@ def get_db_connection():
         conn = psycopg2.connect(db_url)
         return conn
     except Exception as e:
-        st.error(f"Erro de Conexão: {e}")
+        st.error(f"Erro Crítico de Conexão: {e}")
         st.stop()
 
-# --- 2. CACHE DE DADOS (Guarda as listas) ---
+# --- 2. CACHE DE DADOS ---
 @st.cache_data(ttl=600)
 def get_data(query):
     conn = get_db_connection()
@@ -36,9 +36,10 @@ def get_data(query):
             st.error(f"Erro ao ler dados: {e}")
             return []
 
-# --- Função de Escrita (Limpa o cache) ---
+# --- Função de Escrita (BLINDADA) ---
 def run_query(query, params=None):
     conn = get_db_connection()
+    # Reconecta se caiu
     if conn.closed != 0:
         st.cache_resource.clear()
         conn = get_db_connection()
@@ -49,11 +50,16 @@ def run_query(query, params=None):
             conn.commit()
             st.cache_data.clear() # Limpa cache visual
             
+            # Retorna ID se for insert com retorno
             if "RETURNING id" in query.lower():
-                return cur.fetchone()['id']
+                result = cur.fetchone()
+                if result:
+                    return result['id']
+                return None
         except Exception as e:
             conn.rollback()
-            st.error(f"Erro ao salvar: {e}")
+            st.error(f"Erro no Banco de Dados: {e}")
+            return None
 
 # --- Inicialização ---
 def init_db():
@@ -126,7 +132,6 @@ with tab1:
             if nome_insumo and custo_embalagem and qtd_embalagem:
                 qtd_total_base = qtd_embalagem * 1000 if unidade_compra in ["kg", "L"] else qtd_embalagem
                 custo_unitario_calc = custo_embalagem / qtd_total_base
-                # CORREÇÃO: float() forçado
                 run_query("INSERT INTO insumos (nome, unidade_medida, custo_total, qtd_embalagem, fator_conversao, custo_unitario, estoque_atual) VALUES (%s, %s, %s, %s, %s, %s, 0)",
                           (nome_insumo, unidade_tipo.split()[0], float(custo_embalagem), float(qtd_total_base), 1, float(custo_unitario_calc)))
                 st.success("Salvo!")
@@ -215,7 +220,6 @@ with tab2:
         if col_act1.button("💾 SALVAR RECEITA", type="primary"):
             if not st.session_state.rec_nome_in: st.error("Nome vazio!"); st.stop()
             
-            # CORREÇÃO: Forçando float() em todos os números
             val_preco = float(st.session_state.rec_venda_in)
             val_custo = float(custo_total)
 
@@ -226,14 +230,17 @@ with tab2:
             else:
                 final_id = run_query("INSERT INTO receitas (nome, preco_venda, custo_total) VALUES (%s, %s, %s) RETURNING id", (st.session_state.rec_nome_in, val_preco, val_custo))
             
-            for item in st.session_state.ingredientes_temp:
-                # CORREÇÃO: Forçando float() e int() nos itens
-                run_query("INSERT INTO receita_itens (receita_id, insumo_id, qtd_usada, custo_item) VALUES (%s, %s, %s, %s)", 
-                          (int(final_id), int(item['id']), float(item['qtd']), float(item['custo'])))
-            
-            st.session_state.ingredientes_temp = []; st.session_state.editando_id = None
-            limpar_sessao(['rec_nome_in', 'rec_venda_in', 'rec_qtd_add'])
-            st.success("Receita Salva!"); st.rerun()
+            # Verificação de SEGURANÇA para evitar o erro TypeError
+            if final_id:
+                for item in st.session_state.ingredientes_temp:
+                    run_query("INSERT INTO receita_itens (receita_id, insumo_id, qtd_usada, custo_item) VALUES (%s, %s, %s, %s)", 
+                              (int(final_id), int(item['id']), float(item['qtd']), float(item['custo'])))
+                
+                st.session_state.ingredientes_temp = []; st.session_state.editando_id = None
+                limpar_sessao(['rec_nome_in', 'rec_venda_in', 'rec_qtd_add'])
+                st.success("Receita Salva!"); st.rerun()
+            else:
+                st.error("Erro ao criar cabeçalho da receita. Tente novamente.")
 
         if col_act2.button("❌ Excluir"):
             if st.session_state.editando_id:
