@@ -36,10 +36,9 @@ def get_data(query):
             st.error(f"Erro ao ler dados: {e}")
             return []
 
-# --- Função de Escrita (BLINDADA) ---
+# --- Função de Escrita (BLINDADA E COM DEBUG) ---
 def run_query(query, params=None):
     conn = get_db_connection()
-    # Reconecta se caiu
     if conn.closed != 0:
         st.cache_resource.clear()
         conn = get_db_connection()
@@ -50,7 +49,6 @@ def run_query(query, params=None):
             conn.commit()
             st.cache_data.clear() # Limpa cache visual
             
-            # Retorna ID se for insert com retorno
             if "RETURNING id" in query.lower():
                 result = cur.fetchone()
                 if result:
@@ -58,7 +56,8 @@ def run_query(query, params=None):
                 return None
         except Exception as e:
             conn.rollback()
-            st.error(f"Erro no Banco de Dados: {e}")
+            # AQUI ESTÁ A CORREÇÃO: MOSTRA O ERRO REAL NA TELA
+            st.error(f"⚠️ ERRO NO BANCO DE DADOS: {e}") 
             return None
 
 # --- Inicialização ---
@@ -66,6 +65,7 @@ def init_db():
     try:
         conn = get_db_connection()
         c = conn.cursor()
+        # Tabelas com sintaxe PostgreSQL
         c.execute('''CREATE TABLE IF NOT EXISTS insumos (id SERIAL PRIMARY KEY, nome TEXT, unidade_medida TEXT, custo_total REAL, qtd_embalagem REAL, fator_conversao REAL, custo_unitario REAL, estoque_atual REAL DEFAULT 0)''')
         c.execute('''CREATE TABLE IF NOT EXISTS receitas (id SERIAL PRIMARY KEY, nome TEXT, preco_venda REAL, custo_total REAL)''')
         c.execute('''CREATE TABLE IF NOT EXISTS receita_itens (id SERIAL PRIMARY KEY, receita_id INTEGER, insumo_id INTEGER, qtd_usada REAL, custo_item REAL, FOREIGN KEY(receita_id) REFERENCES receitas(id), FOREIGN KEY(insumo_id) REFERENCES insumos(id))''')
@@ -76,7 +76,8 @@ def init_db():
         c.execute('''CREATE TABLE IF NOT EXISTS vendedoras (id SERIAL PRIMARY KEY, nome TEXT)''')
         c.execute('''CREATE TABLE IF NOT EXISTS consignacoes (id SERIAL PRIMARY KEY, vendedora_id INTEGER, receita_id INTEGER, qtd_entregue REAL, qtd_vendida REAL DEFAULT 0, data_entrega TIMESTAMP, FOREIGN KEY(vendedora_id) REFERENCES vendedoras(id), FOREIGN KEY(receita_id) REFERENCES receitas(id))''')
         conn.commit()
-    except: pass
+    except Exception as e:
+        st.error(f"Erro ao criar tabelas: {e}")
 
 if 'db_init' not in st.session_state:
     init_db(); st.session_state.db_init = True
@@ -230,7 +231,7 @@ with tab2:
             else:
                 final_id = run_query("INSERT INTO receitas (nome, preco_venda, custo_total) VALUES (%s, %s, %s) RETURNING id", (st.session_state.rec_nome_in, val_preco, val_custo))
             
-            # Verificação de SEGURANÇA para evitar o erro TypeError
+            # Verificação de SEGURANÇA
             if final_id:
                 for item in st.session_state.ingredientes_temp:
                     run_query("INSERT INTO receita_itens (receita_id, insumo_id, qtd_usada, custo_item) VALUES (%s, %s, %s, %s)", 
@@ -240,7 +241,7 @@ with tab2:
                 limpar_sessao(['rec_nome_in', 'rec_venda_in', 'rec_qtd_add'])
                 st.success("Receita Salva!"); st.rerun()
             else:
-                st.error("Erro ao criar cabeçalho da receita. Tente novamente.")
+                st.error("ERRO GRAVE: Não foi possível criar o cabeçalho da receita. Veja o erro acima.")
 
         if col_act2.button("❌ Excluir"):
             if st.session_state.editando_id:
@@ -472,5 +473,17 @@ with tab_caixa:
         c1.metric("Entradas", format_currency(ent)); c2.metric("Saídas", format_currency(sai)); c3.metric("Saldo", format_currency(ent-sai))
         st.dataframe(cx, use_container_width=True)
 
+# ================= SIDEBAR (ZONA DE PERIGO) =================
 with st.sidebar:
-    if st.button("Resetar Cache"): st.cache_data.clear(); st.cache_resource.clear(); st.rerun()
+    st.divider()
+    st.error("⚠️ ZONA DE PERIGO")
+    st.caption("Se estiver tendo erros de gravação, clique aqui UMA VEZ para recriar as tabelas do zero.")
+    if st.button("🔥 ZERAR E RECRIAR BANCO DE DADOS"):
+        tables = ["venda_itens", "vendas", "receita_itens", "receitas", "insumos", "caixa", "orcamentos", "vendedoras", "consignacoes"]
+        for t in tables: 
+            run_query(f"DROP TABLE IF EXISTS {t} CASCADE")
+        st.cache_data.clear()
+        st.cache_resource.clear()
+        init_db()
+        st.success("Tabelas recriadas! O banco está novo e compatível.")
+        st.rerun()
