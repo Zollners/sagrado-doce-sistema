@@ -5,101 +5,86 @@ import base64
 import os
 import psycopg2
 from psycopg2.extras import RealDictCursor
-import time
 
 # --- Configuração da Página ---
 st.set_page_config(page_title="Sagrado Doce - Sistema", layout="wide", page_icon="🍰")
 
-# --- Função de Conexão (SEM CACHE E COM RE-TENTATIVA) ---
-# Esta função garante que sempre buscamos o dado REAL no banco, nunca uma memória velha.
+# --- Função de Conexão (MODO SEGURO / SEM CACHE) ---
+# Conecta, executa e desconecta. Mais lento, mas inderrubável.
 def get_db_connection():
     try:
         db_url = st.secrets["SUPABASE_URL"]
         conn = psycopg2.connect(db_url)
-        conn.autocommit = True # Garante que salvou na hora
         return conn
     except Exception as e:
-        st.error(f"Erro de Conexão: {e}")
+        st.error(f"Erro de Conexão com Supabase: {e}")
         st.stop()
 
-def run_query(query, params=None):
-    # Tenta 3 vezes antes de desistir (Anti-Queda de internet)
-    for tentativa in range(3):
-        conn = None
-        try:
-            conn = get_db_connection()
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute(query, params)
-                
-                # Se for leitura
-                if query.strip().upper().startswith("SELECT"):
-                    result = cur.fetchall()
-                    conn.close()
-                    return result
-                
-                # Se for gravação com retorno de ID
-                if "RETURNING id" in query.lower():
-                    result = cur.fetchone()['id']
-                    conn.close()
-                    return result
-            
-            # Se for gravação simples
-            conn.close()
-            return None
-
-        except psycopg2.OperationalError:
-            time.sleep(1) # Espera 1 segundo e tenta de novo
-            continue 
-            
-        except Exception as e:
-            if conn: conn.close()
-            st.error(f"Erro no Banco: {e}")
-            return None
-
-# --- Inicialização do Banco (Garante que as tabelas existem) ---
+# --- Inicialização do Banco de Dados ---
 def init_db():
-    run_query('''CREATE TABLE IF NOT EXISTS insumos (id SERIAL PRIMARY KEY, nome TEXT, unidade_medida TEXT, custo_total REAL, qtd_embalagem REAL, fator_conversao REAL, custo_unitario REAL, estoque_atual REAL DEFAULT 0)''')
-    run_query('''CREATE TABLE IF NOT EXISTS receitas (id SERIAL PRIMARY KEY, nome TEXT, preco_venda REAL, custo_total REAL)''')
-    run_query('''CREATE TABLE IF NOT EXISTS receita_itens (id SERIAL PRIMARY KEY, receita_id INTEGER, insumo_id INTEGER, qtd_usada REAL, custo_item REAL, FOREIGN KEY(receita_id) REFERENCES receitas(id), FOREIGN KEY(insumo_id) REFERENCES insumos(id))''')
-    run_query('''CREATE TABLE IF NOT EXISTS vendas (id SERIAL PRIMARY KEY, cliente TEXT, data_pedido TIMESTAMP, tipo_entrega TEXT, endereco TEXT, forma_pagamento TEXT, itens_resumo TEXT, total_venda REAL, status TEXT, status_pagamento TEXT DEFAULT 'Pendente')''')
-    run_query('''CREATE TABLE IF NOT EXISTS venda_itens (id SERIAL PRIMARY KEY, venda_id INTEGER, receita_id INTEGER, qtd INTEGER, FOREIGN KEY(venda_id) REFERENCES vendas(id), FOREIGN KEY(receita_id) REFERENCES receitas(id))''')
-    run_query('''CREATE TABLE IF NOT EXISTS caixa (id SERIAL PRIMARY KEY, descricao TEXT, valor REAL, data_movimento TIMESTAMP, tipo TEXT, categoria TEXT)''')
-    run_query('''CREATE TABLE IF NOT EXISTS orcamentos (id SERIAL PRIMARY KEY, cliente TEXT, data_emissao TEXT, validade TEXT, total REAL, itens_resumo TEXT)''')
-    run_query('''CREATE TABLE IF NOT EXISTS vendedoras (id SERIAL PRIMARY KEY, nome TEXT)''')
-    run_query('''CREATE TABLE IF NOT EXISTS consignacoes (id SERIAL PRIMARY KEY, vendedora_id INTEGER, receita_id INTEGER, qtd_entregue REAL, qtd_vendida REAL DEFAULT 0, data_entrega TIMESTAMP, FOREIGN KEY(vendedora_id) REFERENCES vendedoras(id), FOREIGN KEY(receita_id) REFERENCES receitas(id))''')
+    conn = get_db_connection()
+    c = conn.cursor()
+    # Recria as tabelas se não existirem
+    c.execute('''CREATE TABLE IF NOT EXISTS insumos (id SERIAL PRIMARY KEY, nome TEXT, unidade_medida TEXT, custo_total REAL, qtd_embalagem REAL, fator_conversao REAL, custo_unitario REAL, estoque_atual REAL DEFAULT 0)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS receitas (id SERIAL PRIMARY KEY, nome TEXT, preco_venda REAL, custo_total REAL)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS receita_itens (id SERIAL PRIMARY KEY, receita_id INTEGER, insumo_id INTEGER, qtd_usada REAL, custo_item REAL, FOREIGN KEY(receita_id) REFERENCES receitas(id), FOREIGN KEY(insumo_id) REFERENCES insumos(id))''')
+    c.execute('''CREATE TABLE IF NOT EXISTS vendas (id SERIAL PRIMARY KEY, cliente TEXT, data_pedido TIMESTAMP, tipo_entrega TEXT, endereco TEXT, forma_pagamento TEXT, itens_resumo TEXT, total_venda REAL, status TEXT, status_pagamento TEXT DEFAULT 'Pendente')''')
+    c.execute('''CREATE TABLE IF NOT EXISTS venda_itens (id SERIAL PRIMARY KEY, venda_id INTEGER, receita_id INTEGER, qtd INTEGER, FOREIGN KEY(venda_id) REFERENCES vendas(id), FOREIGN KEY(receita_id) REFERENCES receitas(id))''')
+    c.execute('''CREATE TABLE IF NOT EXISTS caixa (id SERIAL PRIMARY KEY, descricao TEXT, valor REAL, data_movimento TIMESTAMP, tipo TEXT, categoria TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS orcamentos (id SERIAL PRIMARY KEY, cliente TEXT, data_emissao TEXT, validade TEXT, total REAL, itens_resumo TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS vendedoras (id SERIAL PRIMARY KEY, nome TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS consignacoes (id SERIAL PRIMARY KEY, vendedora_id INTEGER, receita_id INTEGER, qtd_entregue REAL, qtd_vendida REAL DEFAULT 0, data_entrega TIMESTAMP, FOREIGN KEY(vendedora_id) REFERENCES vendedoras(id), FOREIGN KEY(receita_id) REFERENCES receitas(id))''')
+    conn.commit()
+    conn.close()
 
 if 'db_initialized' not in st.session_state:
     init_db()
     st.session_state.db_initialized = True
 
-# --- FUNÇÃO ESPECIAL: Baixa Automática de Estoque ---
-def baixar_estoque_por_venda(receita_id, qtd_vendida):
-    # Pega os ingredientes da receita
-    ingredientes = run_query("SELECT insumo_id, qtd_usada FROM receita_itens WHERE receita_id = %s", (receita_id,))
-    if ingredientes:
-        for item in ingredientes:
-            # Calcula total gasto
-            total_descontar = float(item['qtd_usada']) * float(qtd_vendida)
-            # Remove do estoque
-            run_query("UPDATE insumos SET estoque_atual = estoque_atual - %s WHERE id = %s", (total_descontar, item['insumo_id']))
-
 # --- Funções Auxiliares ---
+def run_query(query, params=None):
+    conn = get_db_connection()
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        try:
+            cur.execute(query, params)
+            conn.commit()
+            
+            if query.strip().upper().startswith("SELECT"):
+                return cur.fetchall()
+            if "RETURNING id" in query.lower():
+                return cur.fetchone()['id']
+        except Exception as e:
+            conn.rollback()
+            st.error(f"Erro no Banco: {e}")
+            return None
+    conn.close()
+
 def get_base64_image(image_path):
     if os.path.exists(image_path):
-        with open(image_path, "rb") as img_file: return base64.b64encode(img_file.read()).decode()
+        with open(image_path, "rb") as img_file:
+            return base64.b64encode(img_file.read()).decode()
     return None
 
 def limpar_sessao(keys):
     for key in keys:
         if key in st.session_state: del st.session_state[key]
 
-def format_currency(value): return f"R$ {value:,.2f}"
+def format_currency(value):
+    return f"R$ {value:,.2f}"
 
-# --- CSS (Visual Limpo) ---
+# --- CSS ---
 st.markdown("""
     <style>
-    .stButton>button { width: 100%; border-radius: 5px; height: 3em; font-weight: bold; }
-    .invoice-box { max-width: 800px; margin: auto; padding: 30px; border: 1px solid #eee; background-color: #fff; color: #555; }
+    .invoice-box { max-width: 800px; margin: auto; padding: 30px; border: 1px solid #eee; box-shadow: 0 0 10px rgba(0, 0, 0, 0.15); font-size: 16px; line-height: 24px; font-family: 'Helvetica Neue', 'Helvetica', Arial, sans-serif; color: #555; background-color: #fff; }
+    .header-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+    .logo-container { max-width: 150px; }
+    .logo-img { width: 100%; height: auto; }
+    .header-title { color: #d63384; font-size: 28px; font-weight: bold; text-align: right;}
+    .table-custom { width: 100%; border-collapse: collapse; margin-top: 20px; }
+    .table-custom th { background-color: #f8f9fa; color: #333; padding: 10px; text-align: left; border-bottom: 2px solid #ddd; }
+    .table-custom td { padding: 10px; border-bottom: 1px solid #eee; }
+    .total-row { font-size: 18px; font-weight: bold; color: #d63384; }
+    .subtotal-row { font-size: 14px; color: #777; text-align: right; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -126,9 +111,10 @@ with tab1:
         if nome_insumo and custo_embalagem and qtd_embalagem:
             qtd_total_base = qtd_embalagem * 1000 if unidade_compra in ["kg", "L"] else qtd_embalagem
             custo_unitario_calc = custo_embalagem / qtd_total_base
+            # Proteção float()
             run_query("INSERT INTO insumos (nome, unidade_medida, custo_total, qtd_embalagem, fator_conversao, custo_unitario, estoque_atual) VALUES (%s, %s, %s, %s, %s, %s, 0)",
                       (nome_insumo, unidade_tipo.split()[0], float(custo_embalagem), float(qtd_total_base), 1, float(custo_unitario_calc)))
-            st.success("Salvo com sucesso!"); time.sleep(0.5); st.rerun()
+            st.success("Salvo!"); limpar_sessao(["in_nome", "in_custo", "in_qtd"]); st.rerun()
     
     st.divider()
     with st.expander("🗑️ Excluir Insumo"):
@@ -221,6 +207,7 @@ with tab2:
             if st.button(txt_btn, type="primary"):
                 if not st.session_state.rec_nome_in: st.error("Nome vazio!"); st.stop()
                 
+                # Proteção float()
                 v_preco = float(st.session_state.rec_venda_in)
                 v_custo = float(custo_total)
 
@@ -235,15 +222,16 @@ with tab2:
                               (st.session_state.rec_nome_in, v_preco, v_custo))
                     msg = "Nova Receita Criada!"
                 
+                # Se criou o cabeçalho com sucesso
                 if final_id:
                     for item in st.session_state.ingredientes_temp:
                         run_query("INSERT INTO receita_itens (receita_id, insumo_id, qtd_usada, custo_item) VALUES (%s, %s, %s, %s)", 
                                   (int(final_id), int(item['id']), float(item['qtd']), float(item['custo'])))
                     
                     st.session_state.ingredientes_temp = []; st.session_state.editando_id = None
-                    limpar_sessao(['rec_nome_in', 'rec_venda_in', 'rec_qtd_add']); st.success(msg); time.sleep(0.5); st.rerun()
+                    limpar_sessao(['rec_nome_in', 'rec_venda_in', 'rec_qtd_add']); st.success(msg); st.rerun()
                 else:
-                    st.error("Erro ao salvar receita.")
+                    st.error("Erro ao salvar receita. Tente novamente.")
         
         with col_act2:
             if modo_receita == "Editar Existente" and st.session_state.editando_id:
@@ -253,55 +241,25 @@ with tab2:
                     run_query("DELETE FROM receita_itens WHERE receita_id=%s", (id_para_apagar,))
                     st.session_state.ingredientes_temp = []; st.session_state.editando_id = None
                     limpar_sessao(['rec_nome_in', 'rec_venda_in'])
-                    st.success("Excluída!"); time.sleep(0.5); st.rerun()
+                    st.success("Excluída!"); st.rerun()
 
-# ================= ABA 3: ESTOQUE (COM GESTÃO COMPLETA) =================
+# ================= ABA 3: ESTOQUE =================
 with tab_estoque:
-    st.header("Gerenciar Estoque")
-    
-    data = run_query("SELECT id, nome, unidade_medida, estoque_atual, custo_unitario, custo_total, qtd_embalagem FROM insumos ORDER BY nome")
-    insumos = pd.DataFrame(data) if data else pd.DataFrame()
-    
-    if not insumos.empty:
-        # 1. Movimentação Rápida
-        st.subheader("⚡ Ajuste Rápido (Entrada/Perda)")
-        c1, c2 = st.columns([2, 1])
-        with c1:
-            sel_mov = st.selectbox("Selecione o Insumo", insumos['nome'], key="stk_sel")
-        with c2:
-            qtd_mov = st.number_input("Qtd Adicionar/Remover (+/-)", step=1.0, key="stk_qtd")
-        
-        if st.button("Atualizar Estoque"):
-            iid = insumos[insumos['nome'] == sel_mov]['id'].values[0]
-            run_query("UPDATE insumos SET estoque_atual = estoque_atual + %s WHERE id = %s", (float(qtd_mov), int(iid)))
-            st.success(f"Estoque de {sel_mov} atualizado!"); time.sleep(0.5); st.rerun()
-        
-        st.divider()
-        
-        # 2. Edição de Cadastro
-        st.subheader("✏️ Editar Preço ou Nome")
-        with st.expander("Clique para editar dados do Insumo"):
-            insumo_edit = st.selectbox("Qual insumo editar?", insumos['nome'], key="edit_sel")
-            dados_atuais = insumos[insumos['nome'] == insumo_edit].iloc[0]
-            
-            with st.form("form_edit_insumo"):
-                ce1, ce2 = st.columns(2)
-                novo_nome = ce1.text_input("Nome", value=dados_atuais['nome'])
-                novo_custo_total = ce2.number_input("Custo da Embalagem (R$)", value=float(dados_atuais['custo_total']), min_value=0.0)
-                nova_qtd_emb = ce1.number_input("Qtd na Embalagem", value=float(dados_atuais['qtd_embalagem']), min_value=0.0)
-                novo_estoque = ce2.number_input("Correção Manual de Estoque (Total)", value=float(dados_atuais['estoque_atual']))
-                
-                if st.form_submit_button("Salvar Correções"):
-                    novo_custo_unit = novo_custo_total / nova_qtd_emb if nova_qtd_emb > 0 else 0
-                    
-                    run_query("""
-                        UPDATE insumos 
-                        SET nome=%s, custo_total=%s, qtd_embalagem=%s, estoque_atual=%s, custo_unitario=%s 
-                        WHERE id=%s
-                    """, (novo_nome, float(novo_custo_total), float(nova_qtd_emb), float(novo_estoque), float(novo_custo_unit), int(dados_atuais['id'])))
-                    st.success("Dados atualizados!"); time.sleep(0.5); st.rerun()
-            
-    st.dataframe(insumos[['nome', 'estoque_atual', 'unidade_medida', 'custo_unitario']], use_container_width=True)
+    st.header("Estoque")
+    c1, c2 = st.columns(2)
+    with c1:
+        data = run_query("SELECT id, nome, unidade_medida FROM insumos ORDER BY nome")
+        insumos = pd.DataFrame(data) if data else pd.DataFrame()
+        if not insumos.empty:
+            sel = st.selectbox("Insumo", insumos['nome'], key="stk_sel")
+            qtd = st.number_input("Qtd Adicionar (Negativo reduz)", step=1.0, key="stk_qtd")
+            if st.button("Atualizar Estoque"):
+                iid = insumos[insumos['nome'] == sel]['id'].values[0]
+                run_query("UPDATE insumos SET estoque_atual = estoque_atual + %s WHERE id = %s", (float(qtd), int(iid)))
+                st.success("Ok!"); st.rerun()
+    with c2:
+        data_stk = run_query("SELECT nome, estoque_atual, unidade_medida FROM insumos ORDER BY nome")
+        if data_stk: st.dataframe(pd.DataFrame(data_stk), use_container_width=True)
 
 # ================= ABA 4: ORÇAMENTOS =================
 with tab_orc:
@@ -370,13 +328,16 @@ with tab_orc:
             img_b64 = get_base64_image("logo.png") 
             logo_html = f'<div class="logo-container"><img src="data:image/png;base64,{img_b64}" class="logo-img"></div>' if img_b64 else '<div class="logo-container" style="font-size:40px">🍰</div>'
             itens_html = "".join([f"<tr><td>{i['produto']}</td><td>{i['qtd']}</td><td>{format_currency(i['unitario'])}</td><td>{format_currency(i['total'])}</td></tr>" for i in st.session_state.carrinho_orc])
-            footer_table = f"""<tr class="total-row"><td colspan="3" style="text-align: right;">Total:</td><td>{format_currency(total_original)}</td></tr>"""
+            
             if desconto_reais > 0:
                 footer_table = f"""<tr><td colspan="3" class="subtotal-row">Subtotal:</td><td style="text-align: right;">{format_currency(total_original)}</td></tr><tr><td colspan="3" class="subtotal-row" style="color: red;">Desconto ({desconto_perc:.1f}%):</td><td style="text-align: right; color: red;">- {format_currency(desconto_reais)}</td></tr><tr class="total-row"><td colspan="3" style="text-align: right;">Total Final:</td><td>{format_currency(valor_final_desejado)}</td></tr>"""
+            else:
+                footer_table = f"""<tr class="total-row"><td colspan="3" style="text-align: right;">Total:</td><td>{format_currency(total_original)}</td></tr>"""
+
             html = f"""<div class="invoice-box"><div class="header-top">{logo_html}<div class="header-title">Sagrado Doce</div></div><div style="margin:20px 0"><strong>Cliente:</strong> {orc_cliente}<br><strong>Data:</strong> {hoje}<br><strong>Validade:</strong> {orc_validade}</div><table class="table-custom"><tr class="heading"><th>Item</th><th>Qtd</th><th>Unit.</th><th>Total</th></tr>{itens_html}{footer_table}</table><div style="margin-top:40px; text-align:center; font-size:12px; color:#aaa;">Obrigado pela preferência!</div></div>"""
             st.markdown(html, unsafe_allow_html=True)
 
-# ================= ABA 5: VENDAS (COM BAIXA AUTO) =================
+# ================= ABA 5: VENDAS =================
 with tab3:
     st.header("Vendas & Saídas")
     sub_tab_balcao, sub_tab_vendedoras = st.tabs(["🛒 Venda Balcão", "👜 Vendedoras / Consignado"])
@@ -411,24 +372,14 @@ with tab3:
                 st.dataframe(df_c[['qtd', 'produto', 'total']], use_container_width=True)
                 tot = df_c['total'].sum()
                 st.metric("Total", format_currency(tot))
-                
-                # FINALIZAR VENDA
                 if st.button("✅ Confirmar Pedido", key="conf_venda"):
                     resumo = "; ".join([f"{x['qtd']}x {x['produto']}" for x in st.session_state.carrinho])
-                    
-                    # 1. Cria a Venda
                     vid = run_query("INSERT INTO vendas (cliente, data_pedido, tipo_entrega, endereco, forma_pagamento, itens_resumo, total_venda, status, status_pagamento) VALUES (%s, NOW(), %s, %s, %s, %s, %s, 'Em Produção', 'Pendente') RETURNING id", 
                               (cli, tipo, end, pagto, resumo, float(tot)))
-                    
                     if vid:
                         for i in st.session_state.carrinho: 
-                            # 2. Cria item da venda
                             run_query("INSERT INTO venda_itens (venda_id, receita_id, qtd) VALUES (%s, %s, %s)", (vid, int(i['id']), int(i['qtd'])))
-                            
-                            # 3. BAIXA AUTOMÁTICA DE ESTOQUE
-                            baixar_estoque_por_venda(int(i['id']), float(i['qtd']))
-                        
-                        st.session_state.carrinho = []; limpar_sessao(['v_cli', 'v_end']); st.success("Pedido Feito e Estoque Atualizado!"); time.sleep(0.5); st.rerun()
+                        st.session_state.carrinho = []; limpar_sessao(['v_cli', 'v_end']); st.success("Pedido Feito!"); st.rerun()
 
     with sub_tab_vendedoras:
         col_vend1, col_vend2 = st.columns([1, 2])
@@ -436,7 +387,7 @@ with tab3:
             st.subheader("Vendedora")
             novo_nome_vend = st.text_input("Cadastrar Nova Vendedora")
             if st.button("Cadastrar"):
-                if novo_nome_vend: run_query("INSERT INTO vendedoras (nome) VALUES (%s)", (novo_nome_vend,)); st.success("Cadastrada!"); time.sleep(0.5); st.rerun()
+                if novo_nome_vend: run_query("INSERT INTO vendedoras (nome) VALUES (%s)", (novo_nome_vend,)); st.success("Cadastrada!"); st.rerun()
             st.divider()
             data_vend = run_query("SELECT * FROM vendedoras ORDER BY nome")
             vendedoras_db = pd.DataFrame(data_vend) if data_vend else pd.DataFrame()
@@ -452,7 +403,7 @@ with tab3:
                         if st.button("Entregar para Vendedora"):
                             run_query("INSERT INTO consignacoes (vendedora_id, receita_id, qtd_entregue, data_entrega) VALUES (%s, %s, %s, NOW())", 
                                          (int(vendedora_id), int(id_prod_entregar), float(qtd_entregar)))
-                            st.success(f"Entregue {qtd_entregar}x {prod_entregar}"); time.sleep(0.5); st.rerun()
+                            st.success(f"Entregue {qtd_entregar}x {prod_entregar}"); st.rerun()
             else: st.warning("Cadastre uma vendedora.")
 
         with col_vend2:
@@ -481,9 +432,7 @@ with tab3:
                         total_venda_vend = valor_final_un * qtd_venda_vend
                         st.metric("Total desta Venda", format_currency(total_venda_vend))
                         if st.button("✅ Registrar Venda da Vendedora"):
-                            # Atualiza consignado
                             run_query("UPDATE consignacoes SET qtd_vendida = qtd_vendida + %s WHERE id = %s", (float(qtd_venda_vend), id_consignacao))
-                            
                             resumo_venda = f"{qtd_venda_vend}x {dados_item['nome']} (Via {vendedora_sel_nome})"
                             if desconto_un > 0: resumo_venda += f" [Desc: R${desconto_un}/un]"
                             status_pg = 'Pago' if receber_agora else 'Pendente'
@@ -491,7 +440,7 @@ with tab3:
                                       (f"Vend. {vendedora_sel_nome}", "N/A", pagto_vend, resumo_venda, float(total_venda_vend), status_pg))
                             run_query("INSERT INTO venda_itens (venda_id, receita_id, qtd) VALUES (%s, %s, %s)", (vid, int(dados_item['rec_id']), int(qtd_venda_vend)))
                             if receber_agora: run_query("INSERT INTO caixa (descricao, valor, data_movimento, tipo, categoria) VALUES (%s, %s, NOW(), 'Entrada', 'Vendas')", (f"Venda #{vid} - {vendedora_sel_nome}", float(total_venda_vend)))
-                            st.success("Venda Registrada!"); time.sleep(0.5); st.rerun()
+                            st.success("Venda Registrada!"); st.rerun()
                 else: st.info("Ela não tem produtos em mãos.")
 
 # ================= ABA 6: PRODUÇÃO =================
@@ -510,10 +459,10 @@ with tab4:
                 c2.text(f"{r['tipo_entrega']} | {r['forma_pagamento']}"); c2.markdown(f"**{status_pag}**")
                 if r['status'] == "Em Produção":
                     if c3.button("Finalizar Produção", key=f"f_{r['id']}"):
-                        run_query("UPDATE vendas SET status='Concluído' WHERE id=%s", (r['id'],)); time.sleep(0.5); st.rerun()
+                        run_query("UPDATE vendas SET status='Concluído' WHERE id=%s", (r['id'],)); st.rerun()
                 with c3.expander("Opções"):
                      if st.button("🗑️ Excluir Pedido", key=f"del_v_{r['id']}"):
-                         run_query("DELETE FROM vendas WHERE id=%s", (r['id'],)); run_query("DELETE FROM venda_itens WHERE venda_id=%s", (r['id'],)); st.warning("Excluído"); time.sleep(0.5); st.rerun()
+                         run_query("DELETE FROM vendas WHERE id=%s", (r['id'],)); run_query("DELETE FROM venda_itens WHERE venda_id=%s", (r['id'],)); st.warning("Excluído"); st.rerun()
     else: st.info("Sem pedidos.")
 
 # ================= ABA 7: CAIXA =================
@@ -530,7 +479,7 @@ with tab_caixa:
                 if c2.button("Receber", key=f"rec_{r['id']}"):
                     run_query("UPDATE vendas SET status_pagamento='Pago' WHERE id=%s", (r['id'],))
                     run_query("INSERT INTO caixa (descricao, valor, data_movimento, tipo, categoria) VALUES (%s, %s, NOW(), 'Entrada', 'Vendas')", (f"Venda #{r['id']}", float(r['total_venda'])))
-                    time.sleep(0.5); st.rerun()
+                    st.rerun()
     else: st.info("Tudo pago.")
     
     st.divider()
@@ -539,7 +488,7 @@ with tab_caixa:
         tp = l1.radio("Tipo", ["Saída", "Entrada"]); desc = l2.text_input("Desc"); val = l2.number_input("Valor")
         cat = l3.selectbox("Cat", ["Contas", "Insumos", "Outros"])
         if l3.button("Lançar"): 
-            run_query("INSERT INTO caixa (descricao, valor, data_movimento, tipo, categoria) VALUES (%s, %s, NOW(), %s, %s)", (desc, float(val), tp, cat)); time.sleep(0.5); st.rerun()
+            run_query("INSERT INTO caixa (descricao, valor, data_movimento, tipo, categoria) VALUES (%s, %s, NOW(), %s, %s)", (desc, float(val), tp, cat)); st.rerun()
     
     data_cx = run_query("SELECT * FROM caixa ORDER BY id DESC")
     cx = pd.DataFrame(data_cx) if data_cx else pd.DataFrame()
@@ -550,7 +499,7 @@ with tab_caixa:
         with st.expander("Gerenciar Lançamentos (Excluir)"):
             sel_cx_id = st.selectbox("Selecione ID para excluir:", cx['id'].astype(str) + " - " + cx['descricao'])
             if st.button("Excluir Lançamento Selecionado"):
-                id_to_del = int(sel_cx_id.split(" - ")[0]); run_query("DELETE FROM caixa WHERE id=%s", (id_to_del,)); st.success("Excluído!"); time.sleep(0.5); st.rerun()
+                id_to_del = int(sel_cx_id.split(" - ")[0]); run_query("DELETE FROM caixa WHERE id=%s", (id_to_del,)); st.success("Excluído!"); st.rerun()
         st.dataframe(cx, use_container_width=True)
 
 # --- Sidebar ---
