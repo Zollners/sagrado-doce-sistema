@@ -6,56 +6,59 @@ import os
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import time
-import json
 
 # --- Configuração da Página ---
 st.set_page_config(page_title="Sagrado Doce - Sistema", layout="wide", page_icon="🍰")
 
-# --- Função de Conexão (MODO SEGURO) ---
+# --- Função de Conexão (SEM CACHE E COM RE-TENTATIVA) ---
+# Esta função garante que sempre buscamos o dado REAL no banco, nunca uma memória velha.
 def get_db_connection():
     try:
         db_url = st.secrets["SUPABASE_URL"]
         conn = psycopg2.connect(db_url)
-        conn.autocommit = True 
+        conn.autocommit = True # Garante que salvou na hora
         return conn
     except Exception as e:
         st.error(f"Erro de Conexão: {e}")
         st.stop()
 
 def run_query(query, params=None):
-    for tentativa in range(2):
+    # Tenta 3 vezes antes de desistir (Anti-Queda de internet)
+    for tentativa in range(3):
         conn = None
         try:
             conn = get_db_connection()
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(query, params)
                 
+                # Se for leitura
                 if query.strip().upper().startswith("SELECT"):
                     result = cur.fetchall()
                     conn.close()
                     return result
                 
+                # Se for gravação com retorno de ID
                 if "RETURNING id" in query.lower():
                     result = cur.fetchone()['id']
                     conn.close()
                     return result
+            
+            # Se for gravação simples
             conn.close()
             return None
 
         except psycopg2.OperationalError:
-            time.sleep(1)
+            time.sleep(1) # Espera 1 segundo e tenta de novo
             continue 
+            
         except Exception as e:
             if conn: conn.close()
-            # Ignora erros de "já existe" na criação de tabelas/colunas
-            if "already exists" in str(e) or "duplicate column" in str(e): return None 
             st.error(f"Erro no Banco: {e}")
             return None
 
-# --- Inicialização do Banco ---
+# --- Inicialização do Banco (Garante que as tabelas existem) ---
 def init_db():
-    # Cria tabelas se não existirem
-    run_query('''CREATE TABLE IF NOT EXISTS insumos (id SERIAL PRIMARY KEY, nome TEXT, unidade_medida TEXT, custo_total REAL, qtd_embalagem REAL, fator_conversao REAL, custo_unitario REAL, estoque_atual REAL DEFAULT 0, estoque_minimo REAL DEFAULT 0)''')
+    run_query('''CREATE TABLE IF NOT EXISTS insumos (id SERIAL PRIMARY KEY, nome TEXT, unidade_medida TEXT, custo_total REAL, qtd_embalagem REAL, fator_conversao REAL, custo_unitario REAL, estoque_atual REAL DEFAULT 0)''')
     run_query('''CREATE TABLE IF NOT EXISTS receitas (id SERIAL PRIMARY KEY, nome TEXT, preco_venda REAL, custo_total REAL)''')
     run_query('''CREATE TABLE IF NOT EXISTS receita_itens (id SERIAL PRIMARY KEY, receita_id INTEGER, insumo_id INTEGER, qtd_usada REAL, custo_item REAL, FOREIGN KEY(receita_id) REFERENCES receitas(id), FOREIGN KEY(insumo_id) REFERENCES insumos(id))''')
     run_query('''CREATE TABLE IF NOT EXISTS vendas (id SERIAL PRIMARY KEY, cliente TEXT, data_pedido TIMESTAMP, tipo_entrega TEXT, endereco TEXT, forma_pagamento TEXT, itens_resumo TEXT, total_venda REAL, status TEXT, status_pagamento TEXT DEFAULT 'Pendente')''')
@@ -64,95 +67,47 @@ def init_db():
     run_query('''CREATE TABLE IF NOT EXISTS orcamentos (id SERIAL PRIMARY KEY, cliente TEXT, data_emissao TEXT, validade TEXT, total REAL, itens_resumo TEXT)''')
     run_query('''CREATE TABLE IF NOT EXISTS vendedoras (id SERIAL PRIMARY KEY, nome TEXT)''')
     run_query('''CREATE TABLE IF NOT EXISTS consignacoes (id SERIAL PRIMARY KEY, vendedora_id INTEGER, receita_id INTEGER, qtd_entregue REAL, qtd_vendida REAL DEFAULT 0, data_entrega TIMESTAMP, FOREIGN KEY(vendedora_id) REFERENCES vendedoras(id), FOREIGN KEY(receita_id) REFERENCES receitas(id))''')
-    
-    # Migração de segurança (Tenta adicionar coluna se faltar)
-    try: run_query("ALTER TABLE insumos ADD COLUMN estoque_minimo REAL DEFAULT 0")
-    except: pass
 
 if 'db_initialized' not in st.session_state:
     init_db()
     st.session_state.db_initialized = True
 
-# --- SISTEMA DE BACKUP E RESTAURAÇÃO ---
-def gerar_backup_json():
-    tabelas = ["insumos", "receitas", "vendas", "caixa", "vendedoras", "receita_itens", "venda_itens", "consignacoes"]
-    backup = {}
-    for tabela in tabelas:
-        dados = run_query(f"SELECT * FROM {tabela}")
-        if dados:
-            lista_dados = []
-            for row in dados:
-                item = dict(row)
-                for k, v in item.items():
-                    if isinstance(v, datetime):
-                        item[k] = v.strftime("%Y-%m-%d %H:%M:%S")
-                lista_dados.append(item)
-            backup[tabela] = lista_dados
-        else:
-            backup[tabela] = []
-    return json.dumps(backup, indent=4)
-
-def restaurar_backup(arquivo_json):
-    try:
-        dados_backup = json.load(arquivo_json)
-        ordem_restauracao = ["insumos", "receitas", "vendedoras", "vendas", "receita_itens", "venda_itens", "caixa", "consignacoes"]
-        
-        status_log = []
-        for tabela in ordem_restauracao:
-            if tabela in dados_backup and len(dados_backup[tabela]) > 0:
-                rows = dados_backup[tabela]
-                sucesso = 0
-                for row in rows:
-                    cols = list(row.keys())
-                    vals = [row[c] for c in cols]
-                    placeholders = ["%s"] * len(cols)
-                    q = f"INSERT INTO {tabela} ({','.join(cols)}) VALUES ({','.join(placeholders)}) ON CONFLICT (id) DO NOTHING"
-                    run_query(q, tuple(vals))
-                    sucesso += 1
-                status_log.append(f"✅ {tabela}: {sucesso} itens restaurados.")
-                
-        # Atualiza a sequência dos IDs
-        for t in ordem_restauracao:
-            try: run_query(f"SELECT setval('{t}_id_seq', (SELECT MAX(id) FROM {t}));")
-            except: pass
-            
-        return "\n".join(status_log)
-    except Exception as e:
-        return f"Erro ao ler arquivo: {str(e)}"
-
-# --- Lógica de Negócio ---
+# --- FUNÇÃO ESPECIAL: Baixa Automática de Estoque ---
 def baixar_estoque_por_venda(receita_id, qtd_vendida):
+    # Pega os ingredientes da receita
     ingredientes = run_query("SELECT insumo_id, qtd_usada FROM receita_itens WHERE receita_id = %s", (receita_id,))
     if ingredientes:
         for item in ingredientes:
+            # Calcula total gasto
             total_descontar = float(item['qtd_usada']) * float(qtd_vendida)
+            # Remove do estoque
             run_query("UPDATE insumos SET estoque_atual = estoque_atual - %s WHERE id = %s", (total_descontar, item['insumo_id']))
 
-def format_currency(value): return f"R$ {float(value):,.2f}"
-
-def limpar_sessao(keys):
-    for k in keys: 
-        if k in st.session_state: del st.session_state[k]
-
+# --- Funções Auxiliares ---
 def get_base64_image(image_path):
     if os.path.exists(image_path):
         with open(image_path, "rb") as img_file: return base64.b64encode(img_file.read()).decode()
     return None
 
-# --- CSS ---
+def limpar_sessao(keys):
+    for key in keys:
+        if key in st.session_state: del st.session_state[key]
+
+def format_currency(value): return f"R$ {value:,.2f}"
+
+# --- CSS (Visual Limpo) ---
 st.markdown("""
     <style>
-    .stButton>button { width: 100%; border-radius: 6px; height: 3em; font-weight: bold; }
-    .status-box { padding: 15px; border-radius: 10px; margin-bottom: 10px; font-weight: bold; color: white;}
-    .metric-card { background-color: #f0f2f6; padding: 15px; border-radius: 10px; text-align: center; border: 1px solid #e0e0e0;}
+    .stButton>button { width: 100%; border-radius: 5px; height: 3em; font-weight: bold; }
+    .invoice-box { max-width: 800px; margin: auto; padding: 30px; border: 1px solid #eee; background-color: #fff; color: #555; }
     </style>
 """, unsafe_allow_html=True)
 
 # --- APP ---
 st.title("🍰 Sagrado Doce - Gestão")
 
-tab1, tab2, tab_estoque, tab_orc, tab3, tab4, tab_compras, tab_caixa = st.tabs([
-    "📦 Insumos", "📒 Receitas", "📊 Estoque", "📑 Orçamentos", "🛒 Vendas", "📋 Produção", "🛍️ Compras", "💰 Financeiro"
+tab1, tab2, tab_estoque, tab_orc, tab3, tab4, tab_caixa = st.tabs([
+    "📦 Insumos", "📒 Receitas", "📊 Estoque", "📑 Orçamentos", "🛒 Vendas", "📋 Produção", "💰 Financeiro"
 ])
 
 # ================= ABA 1: INSUMOS =================
@@ -162,20 +117,20 @@ with tab1:
     with col1:
         nome_insumo = st.text_input("Nome", key="in_nome")
         unidade_tipo = st.selectbox("Unidade Uso", ["g (Gramas)", "mL (Mililitros)", "un (Unidade)"], key="in_unidade")
-        minimo = st.number_input("Estoque Mínimo (Alerta)", min_value=0.0, help="Quantidade mínima para não faltar na loja")
     with col2:
-        custo_embalagem = st.number_input("Custo Embalagem (R$)", min_value=0.0, format="%.2f", key="in_custo")
-        qtd_embalagem = st.number_input("Qtd Embalagem", min_value=0.0, format="%.2f", key="in_qtd")
+        custo_embalagem = st.number_input("Custo Embalagem (R$)", min_value=0.0, format="%.2f", value=None, key="in_custo")
+        qtd_embalagem = st.number_input("Qtd Embalagem", min_value=0.0, format="%.2f", value=None, key="in_qtd")
         unidade_compra = st.selectbox("Unidade Compra", ["kg", "g", "L", "mL", "un"], key="in_un_compra")
 
     if st.button("Salvar Insumo"):
         if nome_insumo and custo_embalagem and qtd_embalagem:
             qtd_total_base = qtd_embalagem * 1000 if unidade_compra in ["kg", "L"] else qtd_embalagem
             custo_unitario_calc = custo_embalagem / qtd_total_base
-            run_query("INSERT INTO insumos (nome, unidade_medida, custo_total, qtd_embalagem, fator_conversao, custo_unitario, estoque_atual, estoque_minimo) VALUES (%s, %s, %s, %s, %s, %s, 0, %s)",
-                      (nome_insumo, unidade_tipo.split()[0], float(custo_embalagem), float(qtd_total_base), 1, float(custo_unitario_calc), float(minimo)))
-            st.success("Salvo!"); time.sleep(0.3); st.rerun()
+            run_query("INSERT INTO insumos (nome, unidade_medida, custo_total, qtd_embalagem, fator_conversao, custo_unitario, estoque_atual) VALUES (%s, %s, %s, %s, %s, %s, 0)",
+                      (nome_insumo, unidade_tipo.split()[0], float(custo_embalagem), float(qtd_total_base), 1, float(custo_unitario_calc)))
+            st.success("Salvo com sucesso!"); time.sleep(0.5); st.rerun()
     
+    st.divider()
     with st.expander("🗑️ Excluir Insumo"):
         data = run_query("SELECT id, nome FROM insumos ORDER BY nome")
         insumos_del = pd.DataFrame(data) if data else pd.DataFrame()
@@ -186,12 +141,8 @@ with tab1:
                 run_query("DELETE FROM insumos WHERE id=%s", (int(id_del),))
                 st.success("Excluído!"); st.rerun()
 
-    # Tabela Principal Insumos (BLINDADA CONTRA ERRO DE COLUNA)
-    data = run_query("SELECT nome, unidade_medida, estoque_minimo, custo_unitario FROM insumos ORDER BY nome")
-    # Se não tiver dados, cria DF vazio com as colunas certas para não dar KeyError
-    cols_insumo = ['nome', 'unidade_medida', 'estoque_minimo', 'custo_unitario']
-    insumos_df = pd.DataFrame(data) if data else pd.DataFrame(columns=cols_insumo)
-    st.dataframe(insumos_df, use_container_width=True)
+    data = run_query("SELECT nome, unidade_medida, custo_unitario FROM insumos ORDER BY nome")
+    if data: st.dataframe(pd.DataFrame(data), use_container_width=True)
 
 # ================= ABA 2: RECEITAS =================
 with tab2:
@@ -290,7 +241,7 @@ with tab2:
                                   (int(final_id), int(item['id']), float(item['qtd']), float(item['custo'])))
                     
                     st.session_state.ingredientes_temp = []; st.session_state.editando_id = None
-                    limpar_sessao(['rec_nome_in', 'rec_venda_in', 'rec_qtd_add']); st.success(msg); time.sleep(0.3); st.rerun()
+                    limpar_sessao(['rec_nome_in', 'rec_venda_in', 'rec_qtd_add']); st.success(msg); time.sleep(0.5); st.rerun()
                 else:
                     st.error("Erro ao salvar receita.")
         
@@ -302,16 +253,14 @@ with tab2:
                     run_query("DELETE FROM receita_itens WHERE receita_id=%s", (id_para_apagar,))
                     st.session_state.ingredientes_temp = []; st.session_state.editando_id = None
                     limpar_sessao(['rec_nome_in', 'rec_venda_in'])
-                    st.success("Excluída!"); st.rerun()
+                    st.success("Excluída!"); time.sleep(0.5); st.rerun()
 
-# ================= ABA 3: ESTOQUE (COM GESTÃO COMPLETA E MÍNIMO) =================
+# ================= ABA 3: ESTOQUE (COM GESTÃO COMPLETA) =================
 with tab_estoque:
     st.header("Gerenciar Estoque")
     
-    # Busca dados com BLINDAGEM de colunas vazias
-    data = run_query("SELECT id, nome, unidade_medida, estoque_atual, estoque_minimo, custo_unitario, custo_total, qtd_embalagem FROM insumos ORDER BY nome")
-    cols_est = ['id', 'nome', 'unidade_medida', 'estoque_atual', 'estoque_minimo', 'custo_unitario', 'custo_total', 'qtd_embalagem']
-    insumos = pd.DataFrame(data) if data else pd.DataFrame(columns=cols_est)
+    data = run_query("SELECT id, nome, unidade_medida, estoque_atual, custo_unitario, custo_total, qtd_embalagem FROM insumos ORDER BY nome")
+    insumos = pd.DataFrame(data) if data else pd.DataFrame()
     
     if not insumos.empty:
         # 1. Movimentação Rápida
@@ -322,41 +271,37 @@ with tab_estoque:
         with c2:
             qtd_mov = st.number_input("Qtd Adicionar/Remover (+/-)", step=1.0, key="stk_qtd")
         
-        if st.button("Atualizar Quantidade"):
+        if st.button("Atualizar Estoque"):
             iid = insumos[insumos['nome'] == sel_mov]['id'].values[0]
             run_query("UPDATE insumos SET estoque_atual = estoque_atual + %s WHERE id = %s", (float(qtd_mov), int(iid)))
-            st.success(f"Estoque de {sel_mov} atualizado!"); st.rerun()
+            st.success(f"Estoque de {sel_mov} atualizado!"); time.sleep(0.5); st.rerun()
         
         st.divider()
         
-        # 2. Edição de Cadastro e Mínimo
-        st.subheader("✏️ Editar Cadastro (Valores e Mínimo)")
-        with st.expander("Clique para editar nome, preço ou mínimo"):
+        # 2. Edição de Cadastro
+        st.subheader("✏️ Editar Preço ou Nome")
+        with st.expander("Clique para editar dados do Insumo"):
             insumo_edit = st.selectbox("Qual insumo editar?", insumos['nome'], key="edit_sel")
             dados_atuais = insumos[insumos['nome'] == insumo_edit].iloc[0]
             
             with st.form("form_edit_insumo"):
                 ce1, ce2 = st.columns(2)
                 novo_nome = ce1.text_input("Nome", value=dados_atuais['nome'])
-                # NOVO: Editar Mínimo
-                novo_minimo = ce2.number_input("Estoque Mínimo (Alerta)", value=float(dados_atuais['estoque_minimo']), min_value=0.0)
-                novo_custo_total = ce1.number_input("Custo da Embalagem (R$)", value=float(dados_atuais['custo_total']), min_value=0.0)
-                nova_qtd_emb = ce2.number_input("Qtd na Embalagem", value=float(dados_atuais['qtd_embalagem']), min_value=0.0)
-                novo_estoque = st.number_input("Correção Manual de Estoque (Total)", value=float(dados_atuais['estoque_atual']))
+                novo_custo_total = ce2.number_input("Custo da Embalagem (R$)", value=float(dados_atuais['custo_total']), min_value=0.0)
+                nova_qtd_emb = ce1.number_input("Qtd na Embalagem", value=float(dados_atuais['qtd_embalagem']), min_value=0.0)
+                novo_estoque = ce2.number_input("Correção Manual de Estoque (Total)", value=float(dados_atuais['estoque_atual']))
                 
-                if st.form_submit_button("Salvar Alterações"):
-                    # Recalcula custo unitário
+                if st.form_submit_button("Salvar Correções"):
                     novo_custo_unit = novo_custo_total / nova_qtd_emb if nova_qtd_emb > 0 else 0
                     
                     run_query("""
                         UPDATE insumos 
-                        SET nome=%s, custo_total=%s, qtd_embalagem=%s, estoque_atual=%s, estoque_minimo=%s, custo_unitario=%s 
+                        SET nome=%s, custo_total=%s, qtd_embalagem=%s, estoque_atual=%s, custo_unitario=%s 
                         WHERE id=%s
-                    """, (novo_nome, float(novo_custo_total), float(nova_qtd_emb), float(novo_estoque), float(novo_minimo), float(novo_custo_unit), int(dados_atuais['id'])))
-                    st.success("Dados atualizados!"); st.rerun()
+                    """, (novo_nome, float(novo_custo_total), float(nova_qtd_emb), float(novo_estoque), float(novo_custo_unit), int(dados_atuais['id'])))
+                    st.success("Dados atualizados!"); time.sleep(0.5); st.rerun()
             
-    # Tabela Final - BLINDADA
-    st.dataframe(insumos[['nome', 'estoque_atual', 'estoque_minimo', 'unidade_medida']], use_container_width=True)
+    st.dataframe(insumos[['nome', 'estoque_atual', 'unidade_medida', 'custo_unitario']], use_container_width=True)
 
 # ================= ABA 4: ORÇAMENTOS =================
 with tab_orc:
@@ -481,10 +426,9 @@ with tab3:
                             run_query("INSERT INTO venda_itens (venda_id, receita_id, qtd) VALUES (%s, %s, %s)", (vid, int(i['id']), int(i['qtd'])))
                             
                             # 3. BAIXA AUTOMÁTICA DE ESTOQUE
-                            # Chama a função que desconta os insumos dessa receita
                             baixar_estoque_por_venda(int(i['id']), float(i['qtd']))
                         
-                        st.session_state.carrinho = []; limpar_sessao(['v_cli', 'v_end']); st.success("Pedido Feito e Estoque Atualizado!"); st.rerun()
+                        st.session_state.carrinho = []; limpar_sessao(['v_cli', 'v_end']); st.success("Pedido Feito e Estoque Atualizado!"); time.sleep(0.5); st.rerun()
 
     with sub_tab_vendedoras:
         col_vend1, col_vend2 = st.columns([1, 2])
@@ -492,7 +436,7 @@ with tab3:
             st.subheader("Vendedora")
             novo_nome_vend = st.text_input("Cadastrar Nova Vendedora")
             if st.button("Cadastrar"):
-                if novo_nome_vend: run_query("INSERT INTO vendedoras (nome) VALUES (%s)", (novo_nome_vend,)); st.success("Cadastrada!"); st.rerun()
+                if novo_nome_vend: run_query("INSERT INTO vendedoras (nome) VALUES (%s)", (novo_nome_vend,)); st.success("Cadastrada!"); time.sleep(0.5); st.rerun()
             st.divider()
             data_vend = run_query("SELECT * FROM vendedoras ORDER BY nome")
             vendedoras_db = pd.DataFrame(data_vend) if data_vend else pd.DataFrame()
@@ -508,7 +452,7 @@ with tab3:
                         if st.button("Entregar para Vendedora"):
                             run_query("INSERT INTO consignacoes (vendedora_id, receita_id, qtd_entregue, data_entrega) VALUES (%s, %s, %s, NOW())", 
                                          (int(vendedora_id), int(id_prod_entregar), float(qtd_entregar)))
-                            st.success(f"Entregue {qtd_entregar}x {prod_entregar}"); st.rerun()
+                            st.success(f"Entregue {qtd_entregar}x {prod_entregar}"); time.sleep(0.5); st.rerun()
             else: st.warning("Cadastre uma vendedora.")
 
         with col_vend2:
@@ -540,10 +484,6 @@ with tab3:
                             # Atualiza consignado
                             run_query("UPDATE consignacoes SET qtd_vendida = qtd_vendida + %s WHERE id = %s", (float(qtd_venda_vend), id_consignacao))
                             
-                            # Baixa no Estoque (Venda via Vendedora também desconta estoque da loja?)
-                            # Geralmente a entrega para vendedora não baixou estoque ainda, então baixamos agora:
-                            # baixar_estoque_por_venda(int(dados_item['rec_id']), float(qtd_venda_vend))
-                            
                             resumo_venda = f"{qtd_venda_vend}x {dados_item['nome']} (Via {vendedora_sel_nome})"
                             if desconto_un > 0: resumo_venda += f" [Desc: R${desconto_un}/un]"
                             status_pg = 'Pago' if receber_agora else 'Pendente'
@@ -551,7 +491,7 @@ with tab3:
                                       (f"Vend. {vendedora_sel_nome}", "N/A", pagto_vend, resumo_venda, float(total_venda_vend), status_pg))
                             run_query("INSERT INTO venda_itens (venda_id, receita_id, qtd) VALUES (%s, %s, %s)", (vid, int(dados_item['rec_id']), int(qtd_venda_vend)))
                             if receber_agora: run_query("INSERT INTO caixa (descricao, valor, data_movimento, tipo, categoria) VALUES (%s, %s, NOW(), 'Entrada', 'Vendas')", (f"Venda #{vid} - {vendedora_sel_nome}", float(total_venda_vend)))
-                            st.success("Venda Registrada!"); st.rerun()
+                            st.success("Venda Registrada!"); time.sleep(0.5); st.rerun()
                 else: st.info("Ela não tem produtos em mãos.")
 
 # ================= ABA 6: PRODUÇÃO =================
@@ -570,120 +510,18 @@ with tab4:
                 c2.text(f"{r['tipo_entrega']} | {r['forma_pagamento']}"); c2.markdown(f"**{status_pag}**")
                 if r['status'] == "Em Produção":
                     if c3.button("Finalizar Produção", key=f"f_{r['id']}"):
-                        run_query("UPDATE vendas SET status='Concluído' WHERE id=%s", (r['id'],)); st.rerun()
+                        run_query("UPDATE vendas SET status='Concluído' WHERE id=%s", (r['id'],)); time.sleep(0.5); st.rerun()
                 with c3.expander("Opções"):
                      if st.button("🗑️ Excluir Pedido", key=f"del_v_{r['id']}"):
-                         run_query("DELETE FROM vendas WHERE id=%s", (r['id'],)); run_query("DELETE FROM venda_itens WHERE venda_id=%s", (r['id'],)); st.warning("Excluído"); st.rerun()
+                         run_query("DELETE FROM vendas WHERE id=%s", (r['id'],)); run_query("DELETE FROM venda_itens WHERE venda_id=%s", (r['id'],)); st.warning("Excluído"); time.sleep(0.5); st.rerun()
     else: st.info("Sem pedidos.")
 
-# ================= ABA 7: LISTA DE COMPRAS (MRP AVANÇADO) =================
-with tab_compras:
-    st.header("🛍️ Planejamento de Compras (MRP)")
-    st.info("Aqui você vê a separação exata entre o que precisa para os pedidos e para repor o estoque mínimo.")
-    
-    # 1. Pega todas as vendas pendentes de produção
-    vendas_pendentes = run_query("SELECT id FROM vendas WHERE status = 'Em Produção'")
-    
-    # Monta lista de IDs ou usa "0" se não tiver nada
-    ids_vendas = tuple([v['id'] for v in vendas_pendentes]) if vendas_pendentes else "(0)"
-    if len(ids_vendas) == 1 and ids_vendas != "(0)": ids_vendas = f"({ids_vendas[0]})"
-    else: ids_vendas = str(ids_vendas)
-    
-    # 2. SQL Mágico Completo (Com Estoque Mínimo)
-    query_necessidade = f"""
-        SELECT i.nome, i.estoque_atual, i.estoque_minimo, i.unidade_medida, i.custo_unitario, 
-               COALESCE(SUM(ri.qtd_usada * vi.qtd), 0) as precisa_producao
-        FROM insumos i
-        LEFT JOIN (
-            SELECT ri.insumo_id, ri.qtd_usada, vi.qtd 
-            FROM venda_itens vi
-            JOIN receita_itens ri ON vi.receita_id = ri.receita_id
-            WHERE vi.venda_id IN {ids_vendas}
-        ) as consumo ON i.id = consumo.insumo_id
-        GROUP BY i.nome, i.estoque_atual, i.estoque_minimo, i.unidade_medida, i.custo_unitario
-    """
-    dados_mrp = run_query(query_necessidade)
-    
-    if dados_mrp:
-        df_mrp = pd.DataFrame(dados_mrp)
-        
-        # Lógica MRP: (Precisa para Pedido + Mínimo para Segurança) - O que já tenho
-        df_mrp['Total Necessário'] = df_mrp['precisa_producao'] + df_mrp['estoque_minimo']
-        df_mrp['Saldo Final'] = df_mrp['estoque_atual'] - df_mrp['Total Necessário']
-        df_mrp['Comprar'] = df_mrp['Saldo Final'].apply(lambda x: abs(x) if x < 0 else 0)
-        df_mrp['Custo Est.'] = df_mrp['Comprar'] * df_mrp['custo_unitario']
-        
-        falta = df_mrp[df_mrp['Comprar'] > 0].copy()
-        
-        if not falta.empty:
-            st.error(f"🚨 LISTA DE COMPRAS: Custo Estimado {format_currency(falta['Custo Est.'].sum())}")
-            st.dataframe(falta[['nome', 'precisa_producao', 'estoque_minimo', 'estoque_atual', 'Comprar', 'unidade_medida', 'Custo Est.']], use_container_width=True)
-        else:
-            st.success("✅ Estoque está saudável! Nada para comprar.")
-            
-        with st.expander("Ver Todos os Itens (Mesmo os que não precisa comprar)"):
-            st.dataframe(df_mrp[['nome', 'estoque_atual', 'estoque_minimo', 'precisa_producao', 'Comprar']], use_container_width=True)
-        
-        # Detalhe por Pedido (Micro Visão)
-        st.divider()
-        st.subheader("🔍 Consultar Insumos por Receita Vendida")
-        if vendas_pendentes:
-            venda_sel = st.selectbox("Selecione o Pedido Pendente", [f"{v['id']}" for v in vendas_pendentes])
-            if venda_sel:
-                q_micro = f"""
-                    SELECT i.nome, (ri.qtd_usada * vi.qtd) as precisa_para_pedido, i.estoque_atual, i.unidade_medida
-                    FROM venda_itens vi
-                    JOIN receita_itens ri ON vi.receita_id = ri.receita_id
-                    JOIN insumos i ON ri.insumo_id = i.id
-                    WHERE vi.venda_id = {venda_sel}
-                """
-                micro = run_query(q_micro)
-                if micro:
-                    st.dataframe(pd.DataFrame(micro), use_container_width=True)
-        else:
-            st.info("Nenhum pedido pendente para consulta detalhada.")
-
-# ================= ABA 8: CAIXA (COM GRÁFICOS) =================
+# ================= ABA 7: CAIXA =================
 with tab_caixa:
-    st.header("Financeiro e Relatórios")
-    
-    # 1. Dashboard Gráfico
-    data_cx_all = run_query("SELECT * FROM caixa")
-    if data_cx_all:
-        df_dash = pd.DataFrame(data_cx_all)
-        
-        c1, c2, c3 = st.columns(3)
-        ent = df_dash[df_dash['tipo'] == 'Entrada']['valor'].sum()
-        sai = df_dash[df_dash['tipo'] == 'Saída']['valor'].sum()
-        c1.metric("Total Entradas", format_currency(ent))
-        c2.metric("Total Saídas", format_currency(sai))
-        c3.metric("Saldo Atual", format_currency(ent - sai))
-        
-        st.divider()
-        col_g1, col_g2 = st.columns(2)
-        
-        with col_g1:
-            st.subheader("Despesas por Categoria")
-            gastos = df_dash[df_dash['tipo'] == 'Saída']
-            if not gastos.empty:
-                gastos_cat = gastos.groupby('categoria')['valor'].sum()
-                st.bar_chart(gastos_cat)
-            else: st.info("Sem despesas registradas.")
-            
-        with col_g2:
-            st.subheader("Fluxo Recente")
-            if not df_dash.empty:
-                df_dash['data_movimento'] = pd.to_datetime(df_dash['data_movimento'])
-                # Agrupar por dia para o gráfico ficar mais limpo
-                fluxo_diario = df_dash.groupby([df_dash['data_movimento'].dt.date, 'tipo'])['valor'].sum().unstack().fillna(0)
-                st.line_chart(fluxo_diario)
-
-    st.divider()
-    
-    # 2. Pendentes
-    st.subheader("A Receber (Vendas)")
-    data_p = run_query("SELECT id, cliente, total_venda FROM vendas WHERE status_pagamento = 'Pendente'")
-    pend = pd.DataFrame(data_p) if data_p else pd.DataFrame()
+    st.header("Financeiro")
+    st.subheader("Pendentes")
+    data = run_query("SELECT id, cliente, total_venda FROM vendas WHERE status_pagamento = 'Pendente'")
+    pend = pd.DataFrame(data) if data else pd.DataFrame()
     if not pend.empty:
         for _, r in pend.iterrows():
             with st.container(border=True):
@@ -692,62 +530,33 @@ with tab_caixa:
                 if c2.button("Receber", key=f"rec_{r['id']}"):
                     run_query("UPDATE vendas SET status_pagamento='Pago' WHERE id=%s", (r['id'],))
                     run_query("INSERT INTO caixa (descricao, valor, data_movimento, tipo, categoria) VALUES (%s, %s, NOW(), 'Entrada', 'Vendas')", (f"Venda #{r['id']}", float(r['total_venda'])))
-                    st.rerun()
-    else: st.info("Nenhuma venda pendente.")
+                    time.sleep(0.5); st.rerun()
+    else: st.info("Tudo pago.")
     
     st.divider()
+    with st.expander("Lançamento Manual"):
+        l1, l2, l3 = st.columns(3)
+        tp = l1.radio("Tipo", ["Saída", "Entrada"]); desc = l2.text_input("Desc"); val = l2.number_input("Valor")
+        cat = l3.selectbox("Cat", ["Contas", "Insumos", "Outros"])
+        if l3.button("Lançar"): 
+            run_query("INSERT INTO caixa (descricao, valor, data_movimento, tipo, categoria) VALUES (%s, %s, NOW(), %s, %s)", (desc, float(val), tp, cat)); time.sleep(0.5); st.rerun()
     
-    # 3. Lançamento Manual (Categorias Novas)
-    with st.expander("💰 Lançamento Manual (Despesas/Entradas)", expanded=True):
-        with st.form("form_cx_manual"):
-            l1, l2, l3 = st.columns(3)
-            tp = l1.radio("Tipo", ["Saída", "Entrada"])
-            desc = l2.text_input("Descrição (Ex: Leite no Mercado)")
-            val = l2.number_input("Valor", min_value=0.0)
-            
-            # Novas Categorias Solicitadas
-            cats = ["Insumos", "Mercado", "Cia do Doce", "Embalagem", "Contas Fixas", "Vendas", "Outros"]
-            cat = l3.selectbox("Categoria", cats)
-            
-            if st.form_submit_button("Lançar"): 
-                run_query("INSERT INTO caixa (descricao, valor, data_movimento, tipo, categoria) VALUES (%s, %s, NOW(), %s, %s)", (desc, float(val), tp, cat)); st.rerun()
-    
-    # 4. Extrato
-    data_cx = run_query("SELECT * FROM caixa ORDER BY id DESC LIMIT 50")
+    data_cx = run_query("SELECT * FROM caixa ORDER BY id DESC")
     cx = pd.DataFrame(data_cx) if data_cx else pd.DataFrame()
     if not cx.empty:
-        st.dataframe(cx, use_container_width=True)
-        with st.expander("Gerenciar (Excluir Lançamento Errado)"):
+        ent = cx[cx['tipo']=='Entrada']['valor'].sum(); sai = cx[cx['tipo']=='Saída']['valor'].sum()
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Entradas", format_currency(ent)); c2.metric("Saídas", format_currency(sai)); c3.metric("Saldo", format_currency(ent-sai))
+        with st.expander("Gerenciar Lançamentos (Excluir)"):
             sel_cx_id = st.selectbox("Selecione ID para excluir:", cx['id'].astype(str) + " - " + cx['descricao'])
             if st.button("Excluir Lançamento Selecionado"):
-                id_to_del = int(sel_cx_id.split(" - ")[0]); run_query("DELETE FROM caixa WHERE id=%s", (id_to_del,)); st.success("Excluído!"); st.rerun()
+                id_to_del = int(sel_cx_id.split(" - ")[0]); run_query("DELETE FROM caixa WHERE id=%s", (id_to_del,)); st.success("Excluído!"); time.sleep(0.5); st.rerun()
+        st.dataframe(cx, use_container_width=True)
 
-# --- Sidebar (BACKUP & RESTORE) ---
+# --- Sidebar ---
 with st.sidebar:
-    st.header("Segurança & Backup")
-    
-    # Botão de Gerar Backup
-    if st.button("📥 Gerar Backup Completo"):
-        json_backup = gerar_backup_json()
-        st.download_button(
-            label="Clique para Baixar Backup (.json)",
-            data=json_backup,
-            file_name=f"backup_sagrado_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
-            mime="application/json"
-        )
-        st.success("Backup Gerado! Clique acima para baixar.")
-
-    st.divider()
-    
-    # Área de Restauração
-    st.write("🔄 **Restaurar Backup**")
-    uploaded_file = st.file_uploader("Arraste o arquivo .json aqui", type=["json"])
-    if uploaded_file is not None:
-        if st.button("⚠️ CONFIRMAR RESTAURAÇÃO"):
-            msg = restaurar_backup(uploaded_file)
-            st.success("Processo finalizado!")
-            st.text(msg)
-            time.sleep(2)
-            st.rerun()
-    
-    st.info("ℹ️ Este sistema faz backup automático na nuvem, mas recomendamos baixar o backup manual semanalmente.")
+    st.info("ℹ️ Para usar logo: Salve arquivo 'logo.png' na pasta do app.")
+    if st.button("🗑️ Resetar Tudo (Banco Zerado)") and st.button("Confirmar Reset"):
+        tables = ["venda_itens", "vendas", "receita_itens", "receitas", "insumos", "caixa", "orcamentos", "vendedoras", "consignacoes"]
+        for t in tables: run_query(f"TRUNCATE TABLE {t} CASCADE")
+        st.session_state.clear(); st.rerun()
