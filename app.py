@@ -682,10 +682,3 @@ with tab_caixa:
             if st.button("Excluir Lançamento Selecionado"):
                 id_to_del = int(sel_cx_id.split(" - ")[0]); run_query("DELETE FROM caixa WHERE id=%s", (id_to_del,)); st.success("Excluído!"); st.rerun()
 
-# --- Sidebar ---
-with st.sidebar:
-    st.info("ℹ️ Para usar logo: Salve arquivo 'logo.png' na pasta do app.")
-    if st.button("🗑️ Resetar Tudo (Banco Zerado)") and st.button("Confirmar Reset"):
-        tables = ["venda_itens", "vendas", "receita_itens", "receitas", "insumos", "caixa", "orcamentos", "vendedoras", "consignacoes"]
-        for t in tables: run_query(f"TRUNCATE TABLE {t} CASCADE")
-        st.session_state.clear(); st.rerun()
