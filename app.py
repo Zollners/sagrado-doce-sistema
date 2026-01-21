@@ -6,16 +6,17 @@ import os
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import time
+import json
 
 # --- Configuração da Página ---
 st.set_page_config(page_title="Sagrado Doce - Sistema", layout="wide", page_icon="🍰")
 
-# --- Função de Conexão (MODO BLINDADO COM RE-TENTATIVA) ---
-# MANTIDA A ESTRUTURA ORIGINAL QUE FUNCIONOU
+# --- Função de Conexão (SEM CACHE - MODO SEGURO) ---
 def get_db_connection():
     try:
         db_url = st.secrets["SUPABASE_URL"]
         conn = psycopg2.connect(db_url)
+        conn.autocommit = True 
         return conn
     except Exception as e:
         st.error(f"Erro de Conexão: {e}")
@@ -28,7 +29,6 @@ def run_query(query, params=None):
             conn = get_db_connection()
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(query, params)
-                conn.commit()
                 
                 if query.strip().upper().startswith("SELECT"):
                     result = cur.fetchall()
@@ -39,25 +39,21 @@ def run_query(query, params=None):
                     result = cur.fetchone()['id']
                     conn.close()
                     return result
-            
             conn.close()
             return None
 
         except psycopg2.OperationalError:
-            if conn: conn.close()
-            time.sleep(1) # Pequena pausa para garantir reconexão
+            time.sleep(1)
             continue 
-            
         except Exception as e:
             if conn: conn.close()
-            # Ignora erro se a coluna já existir (migração)
-            if "already exists" in str(e): return None
+            if "already exists" in str(e): return None 
             st.error(f"Erro no Banco: {e}")
             return None
 
-# --- Inicialização do Banco de Dados ---
+# --- Inicialização do Banco ---
 def init_db():
-    # Cria as tabelas básicas
+    # Cria tabelas se não existirem
     run_query('''CREATE TABLE IF NOT EXISTS insumos (id SERIAL PRIMARY KEY, nome TEXT, unidade_medida TEXT, custo_total REAL, qtd_embalagem REAL, fator_conversao REAL, custo_unitario REAL, estoque_atual REAL DEFAULT 0, estoque_minimo REAL DEFAULT 0)''')
     run_query('''CREATE TABLE IF NOT EXISTS receitas (id SERIAL PRIMARY KEY, nome TEXT, preco_venda REAL, custo_total REAL)''')
     run_query('''CREATE TABLE IF NOT EXISTS receita_itens (id SERIAL PRIMARY KEY, receita_id INTEGER, insumo_id INTEGER, qtd_usada REAL, custo_item REAL, FOREIGN KEY(receita_id) REFERENCES receitas(id), FOREIGN KEY(insumo_id) REFERENCES insumos(id))''')
@@ -68,29 +64,67 @@ def init_db():
     run_query('''CREATE TABLE IF NOT EXISTS vendedoras (id SERIAL PRIMARY KEY, nome TEXT)''')
     run_query('''CREATE TABLE IF NOT EXISTS consignacoes (id SERIAL PRIMARY KEY, vendedora_id INTEGER, receita_id INTEGER, qtd_entregue REAL, qtd_vendida REAL DEFAULT 0, data_entrega TIMESTAMP, FOREIGN KEY(vendedora_id) REFERENCES vendedoras(id), FOREIGN KEY(receita_id) REFERENCES receitas(id))''')
     
-    # Migração Automática: Tenta adicionar coluna estoque_minimo se não existir (para quem já tem o banco criado)
-    try:
-        run_query("ALTER TABLE insumos ADD COLUMN estoque_minimo REAL DEFAULT 0")
-    except:
-        pass 
+    # Migração de segurança
+    try: run_query("ALTER TABLE insumos ADD COLUMN estoque_minimo REAL DEFAULT 0")
+    except: pass
 
 if 'db_initialized' not in st.session_state:
     init_db()
     st.session_state.db_initialized = True
 
-# --- Funções Auxiliares ---
-def get_base64_image(image_path):
-    if os.path.exists(image_path):
-        with open(image_path, "rb") as img_file: return base64.b64encode(img_file.read()).decode()
-    return None
+# --- SISTEMA DE BACKUP E RESTAURAÇÃO ---
+def gerar_backup_json():
+    tabelas = ["insumos", "receitas", "vendas", "caixa", "vendedoras", "receita_itens", "venda_itens", "consignacoes"]
+    backup = {}
+    for tabela in tabelas:
+        dados = run_query(f"SELECT * FROM {tabela}")
+        if dados:
+            # Converte objetos datetime para string
+            lista_dados = []
+            for row in dados:
+                item = dict(row)
+                for k, v in item.items():
+                    if isinstance(v, datetime):
+                        item[k] = v.strftime("%Y-%m-%d %H:%M:%S")
+                lista_dados.append(item)
+            backup[tabela] = lista_dados
+        else:
+            backup[tabela] = []
+    return json.dumps(backup, indent=4)
 
-def limpar_sessao(keys):
-    for key in keys:
-        if key in st.session_state: del st.session_state[key]
+def restaurar_backup(arquivo_json):
+    try:
+        dados_backup = json.load(arquivo_json)
+        # Ordem importante para respeitar chaves estrangeiras (Pai antes do Filho)
+        ordem_restauracao = ["insumos", "receitas", "vendedoras", "vendas", "receita_itens", "venda_itens", "caixa", "consignacoes"]
+        
+        status_log = []
+        for tabela in ordem_restauracao:
+            if tabela in dados_backup and len(dados_backup[tabela]) > 0:
+                rows = dados_backup[tabela]
+                sucesso = 0
+                for row in rows:
+                    # Limpa chaves vazias e prepara colunas
+                    cols = list(row.keys())
+                    vals = [row[c] for c in cols]
+                    placeholders = ["%s"] * len(cols)
+                    
+                    # Query genérica de Insert
+                    q = f"INSERT INTO {tabela} ({','.join(cols)}) VALUES ({','.join(placeholders)}) ON CONFLICT (id) DO NOTHING"
+                    run_query(q, tuple(vals))
+                    sucesso += 1
+                status_log.append(f"✅ {tabela}: {sucesso} itens restaurados.")
+                
+        # Atualiza a sequência dos IDs para não dar erro em novos cadastros
+        for t in ordem_restauracao:
+            try: run_query(f"SELECT setval('{t}_id_seq', (SELECT MAX(id) FROM {t}));")
+            except: pass
+            
+        return "\n".join(status_log)
+    except Exception as e:
+        return f"Erro ao ler arquivo: {str(e)}"
 
-def format_currency(value): return f"R$ {float(value):,.2f}"
-
-# --- FUNÇÃO INTEELIGENTE: BAIXA DE ESTOQUE ---
+# --- Lógica de Negócio ---
 def baixar_estoque_por_venda(receita_id, qtd_vendida):
     ingredientes = run_query("SELECT insumo_id, qtd_usada FROM receita_itens WHERE receita_id = %s", (receita_id,))
     if ingredientes:
@@ -98,27 +132,29 @@ def baixar_estoque_por_venda(receita_id, qtd_vendida):
             total_descontar = float(item['qtd_usada']) * float(qtd_vendida)
             run_query("UPDATE insumos SET estoque_atual = estoque_atual - %s WHERE id = %s", (total_descontar, item['insumo_id']))
 
+def format_currency(value): return f"R$ {float(value):,.2f}"
+
+def limpar_sessao(keys):
+    for k in keys: 
+        if k in st.session_state: del st.session_state[k]
+
+def get_base64_image(image_path):
+    if os.path.exists(image_path):
+        with open(image_path, "rb") as img_file: return base64.b64encode(img_file.read()).decode()
+    return None
+
 # --- CSS ---
 st.markdown("""
     <style>
-    .invoice-box { max-width: 800px; margin: auto; padding: 30px; border: 1px solid #eee; box-shadow: 0 0 10px rgba(0, 0, 0, 0.15); font-size: 16px; line-height: 24px; font-family: 'Helvetica Neue', 'Helvetica', Arial, sans-serif; color: #555; background-color: #fff; }
-    .header-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
-    .logo-container { max-width: 150px; }
-    .logo-img { width: 100%; height: auto; }
-    .header-title { color: #d63384; font-size: 28px; font-weight: bold; text-align: right;}
-    .table-custom { width: 100%; border-collapse: collapse; margin-top: 20px; }
-    .table-custom th { background-color: #f8f9fa; color: #333; padding: 10px; text-align: left; border-bottom: 2px solid #ddd; }
-    .table-custom td { padding: 10px; border-bottom: 1px solid #eee; }
-    .total-row { font-size: 18px; font-weight: bold; color: #d63384; }
-    .subtotal-row { font-size: 14px; color: #777; text-align: right; }
-    .stButton>button { width: 100%; border-radius: 5px; height: 3em; font-weight: bold; }
+    .stButton>button { width: 100%; border-radius: 6px; height: 3em; font-weight: bold; }
+    .status-box { padding: 15px; border-radius: 10px; margin-bottom: 10px; font-weight: bold; color: white;}
+    .metric-card { background-color: #f0f2f6; padding: 15px; border-radius: 10px; text-align: center; border: 1px solid #e0e0e0;}
     </style>
 """, unsafe_allow_html=True)
 
-# --- Interface Principal ---
+# --- APP ---
 st.title("🍰 Sagrado Doce - Gestão")
 
-# Adicionada a aba "Compras"
 tab1, tab2, tab_estoque, tab_orc, tab3, tab4, tab_compras, tab_caixa = st.tabs([
     "📦 Insumos", "📒 Receitas", "📊 Estoque", "📑 Orçamentos", "🛒 Vendas", "📋 Produção", "🛍️ Compras", "💰 Financeiro"
 ])
@@ -130,23 +166,20 @@ with tab1:
     with col1:
         nome_insumo = st.text_input("Nome", key="in_nome")
         unidade_tipo = st.selectbox("Unidade Uso", ["g (Gramas)", "mL (Mililitros)", "un (Unidade)"], key="in_unidade")
-        # NOVO: Estoque Mínimo
-        minimo = st.number_input("Estoque Mínimo (Alerta)", min_value=0.0, help="Quantidade mínima para não faltar")
+        minimo = st.number_input("Estoque Mínimo (Alerta)", min_value=0.0, help="Quantidade mínima para não faltar na loja")
     with col2:
-        custo_embalagem = st.number_input("Custo Embalagem (R$)", min_value=0.0, format="%.2f", value=None, key="in_custo")
-        qtd_embalagem = st.number_input("Qtd Embalagem", min_value=0.0, format="%.2f", value=None, key="in_qtd")
+        custo_embalagem = st.number_input("Custo Embalagem (R$)", min_value=0.0, format="%.2f", key="in_custo")
+        qtd_embalagem = st.number_input("Qtd Embalagem", min_value=0.0, format="%.2f", key="in_qtd")
         unidade_compra = st.selectbox("Unidade Compra", ["kg", "g", "L", "mL", "un"], key="in_un_compra")
 
     if st.button("Salvar Insumo"):
         if nome_insumo and custo_embalagem and qtd_embalagem:
             qtd_total_base = qtd_embalagem * 1000 if unidade_compra in ["kg", "L"] else qtd_embalagem
             custo_unitario_calc = custo_embalagem / qtd_total_base
-            # ATUALIZADO: Inclui estoque_minimo no insert
             run_query("INSERT INTO insumos (nome, unidade_medida, custo_total, qtd_embalagem, fator_conversao, custo_unitario, estoque_atual, estoque_minimo) VALUES (%s, %s, %s, %s, %s, %s, 0, %s)",
                       (nome_insumo, unidade_tipo.split()[0], float(custo_embalagem), float(qtd_total_base), 1, float(custo_unitario_calc), float(minimo)))
-            st.success("Salvo!"); limpar_sessao(["in_nome", "in_custo", "in_qtd"]); st.rerun()
+            st.success("Salvo!"); time.sleep(0.3); st.rerun()
     
-    st.divider()
     with st.expander("🗑️ Excluir Insumo"):
         data = run_query("SELECT id, nome FROM insumos ORDER BY nome")
         insumos_del = pd.DataFrame(data) if data else pd.DataFrame()
@@ -257,7 +290,7 @@ with tab2:
                                   (int(final_id), int(item['id']), float(item['qtd']), float(item['custo'])))
                     
                     st.session_state.ingredientes_temp = []; st.session_state.editando_id = None
-                    limpar_sessao(['rec_nome_in', 'rec_venda_in', 'rec_qtd_add']); st.success(msg); st.rerun()
+                    limpar_sessao(['rec_nome_in', 'rec_venda_in', 'rec_qtd_add']); st.success(msg); time.sleep(0.3); st.rerun()
                 else:
                     st.error("Erro ao salvar receita.")
         
@@ -504,6 +537,10 @@ with tab3:
                             # Atualiza consignado
                             run_query("UPDATE consignacoes SET qtd_vendida = qtd_vendida + %s WHERE id = %s", (float(qtd_venda_vend), id_consignacao))
                             
+                            # Baixa no Estoque (Venda via Vendedora também desconta estoque da loja?)
+                            # Geralmente a entrega para vendedora não baixou estoque ainda, então baixamos agora:
+                            # baixar_estoque_por_venda(int(dados_item['rec_id']), float(qtd_venda_vend))
+                            
                             resumo_venda = f"{qtd_venda_vend}x {dados_item['nome']} (Via {vendedora_sel_nome})"
                             if desconto_un > 0: resumo_venda += f" [Desc: R${desconto_un}/un]"
                             status_pg = 'Pago' if receber_agora else 'Pendente'
@@ -682,3 +719,32 @@ with tab_caixa:
             if st.button("Excluir Lançamento Selecionado"):
                 id_to_del = int(sel_cx_id.split(" - ")[0]); run_query("DELETE FROM caixa WHERE id=%s", (id_to_del,)); st.success("Excluído!"); st.rerun()
 
+# --- Sidebar (BACKUP & RESTORE) ---
+with st.sidebar:
+    st.header("Segurança & Backup")
+    
+    # Botão de Gerar Backup
+    if st.button("📥 Gerar Backup Completo"):
+        json_backup = gerar_backup_json()
+        st.download_button(
+            label="Clique para Baixar Backup (.json)",
+            data=json_backup,
+            file_name=f"backup_sagrado_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
+            mime="application/json"
+        )
+        st.success("Backup Gerado! Clique acima para baixar.")
+
+    st.divider()
+    
+    # Área de Restauração
+    st.write("🔄 **Restaurar Backup**")
+    uploaded_file = st.file_uploader("Arraste o arquivo .json aqui", type=["json"])
+    if uploaded_file is not None:
+        if st.button("⚠️ CONFIRMAR RESTAURAÇÃO"):
+            msg = restaurar_backup(uploaded_file)
+            st.success("Processo finalizado!")
+            st.text(msg)
+            time.sleep(2)
+            st.rerun()
+    
+    st.info("ℹ️ Este sistema faz backup automático na nuvem, mas recomendamos baixar o backup manual semanalmente.")
