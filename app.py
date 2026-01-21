@@ -11,7 +11,7 @@ import json
 # --- Configuração da Página ---
 st.set_page_config(page_title="Sagrado Doce - Sistema", layout="wide", page_icon="🍰")
 
-# --- Função de Conexão (SEM CACHE - MODO SEGURO) ---
+# --- Função de Conexão (MODO SEGURO) ---
 def get_db_connection():
     try:
         db_url = st.secrets["SUPABASE_URL"]
@@ -47,7 +47,8 @@ def run_query(query, params=None):
             continue 
         except Exception as e:
             if conn: conn.close()
-            if "already exists" in str(e): return None 
+            # Ignora erros de "já existe" na criação de tabelas/colunas
+            if "already exists" in str(e) or "duplicate column" in str(e): return None 
             st.error(f"Erro no Banco: {e}")
             return None
 
@@ -64,7 +65,7 @@ def init_db():
     run_query('''CREATE TABLE IF NOT EXISTS vendedoras (id SERIAL PRIMARY KEY, nome TEXT)''')
     run_query('''CREATE TABLE IF NOT EXISTS consignacoes (id SERIAL PRIMARY KEY, vendedora_id INTEGER, receita_id INTEGER, qtd_entregue REAL, qtd_vendida REAL DEFAULT 0, data_entrega TIMESTAMP, FOREIGN KEY(vendedora_id) REFERENCES vendedoras(id), FOREIGN KEY(receita_id) REFERENCES receitas(id))''')
     
-    # Migração de segurança
+    # Migração de segurança (Tenta adicionar coluna se faltar)
     try: run_query("ALTER TABLE insumos ADD COLUMN estoque_minimo REAL DEFAULT 0")
     except: pass
 
@@ -79,7 +80,6 @@ def gerar_backup_json():
     for tabela in tabelas:
         dados = run_query(f"SELECT * FROM {tabela}")
         if dados:
-            # Converte objetos datetime para string
             lista_dados = []
             for row in dados:
                 item = dict(row)
@@ -95,7 +95,6 @@ def gerar_backup_json():
 def restaurar_backup(arquivo_json):
     try:
         dados_backup = json.load(arquivo_json)
-        # Ordem importante para respeitar chaves estrangeiras (Pai antes do Filho)
         ordem_restauracao = ["insumos", "receitas", "vendedoras", "vendas", "receita_itens", "venda_itens", "caixa", "consignacoes"]
         
         status_log = []
@@ -104,18 +103,15 @@ def restaurar_backup(arquivo_json):
                 rows = dados_backup[tabela]
                 sucesso = 0
                 for row in rows:
-                    # Limpa chaves vazias e prepara colunas
                     cols = list(row.keys())
                     vals = [row[c] for c in cols]
                     placeholders = ["%s"] * len(cols)
-                    
-                    # Query genérica de Insert
                     q = f"INSERT INTO {tabela} ({','.join(cols)}) VALUES ({','.join(placeholders)}) ON CONFLICT (id) DO NOTHING"
                     run_query(q, tuple(vals))
                     sucesso += 1
                 status_log.append(f"✅ {tabela}: {sucesso} itens restaurados.")
                 
-        # Atualiza a sequência dos IDs para não dar erro em novos cadastros
+        # Atualiza a sequência dos IDs
         for t in ordem_restauracao:
             try: run_query(f"SELECT setval('{t}_id_seq', (SELECT MAX(id) FROM {t}));")
             except: pass
@@ -190,8 +186,12 @@ with tab1:
                 run_query("DELETE FROM insumos WHERE id=%s", (int(id_del),))
                 st.success("Excluído!"); st.rerun()
 
+    # Tabela Principal Insumos (BLINDADA CONTRA ERRO DE COLUNA)
     data = run_query("SELECT nome, unidade_medida, estoque_minimo, custo_unitario FROM insumos ORDER BY nome")
-    if data: st.dataframe(pd.DataFrame(data), use_container_width=True)
+    # Se não tiver dados, cria DF vazio com as colunas certas para não dar KeyError
+    cols_insumo = ['nome', 'unidade_medida', 'estoque_minimo', 'custo_unitario']
+    insumos_df = pd.DataFrame(data) if data else pd.DataFrame(columns=cols_insumo)
+    st.dataframe(insumos_df, use_container_width=True)
 
 # ================= ABA 2: RECEITAS =================
 with tab2:
@@ -308,8 +308,10 @@ with tab2:
 with tab_estoque:
     st.header("Gerenciar Estoque")
     
+    # Busca dados com BLINDAGEM de colunas vazias
     data = run_query("SELECT id, nome, unidade_medida, estoque_atual, estoque_minimo, custo_unitario, custo_total, qtd_embalagem FROM insumos ORDER BY nome")
-    insumos = pd.DataFrame(data) if data else pd.DataFrame()
+    cols_est = ['id', 'nome', 'unidade_medida', 'estoque_atual', 'estoque_minimo', 'custo_unitario', 'custo_total', 'qtd_embalagem']
+    insumos = pd.DataFrame(data) if data else pd.DataFrame(columns=cols_est)
     
     if not insumos.empty:
         # 1. Movimentação Rápida
@@ -353,6 +355,7 @@ with tab_estoque:
                     """, (novo_nome, float(novo_custo_total), float(nova_qtd_emb), float(novo_estoque), float(novo_minimo), float(novo_custo_unit), int(dados_atuais['id'])))
                     st.success("Dados atualizados!"); st.rerun()
             
+    # Tabela Final - BLINDADA
     st.dataframe(insumos[['nome', 'estoque_atual', 'estoque_minimo', 'unidade_medida']], use_container_width=True)
 
 # ================= ABA 4: ORÇAMENTOS =================
